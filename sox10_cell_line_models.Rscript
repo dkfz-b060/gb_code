@@ -1,0 +1,72 @@
+#!/bin/R
+
+##### code to generate Sup Fig 4 plots of SOX10 methylation/expression in cell line models
+#
+# code from ipynb 20190720
+
+
+
+# define location of working directory
+working.dir <- "20190720_pr001_GB_cell_lines_methylation_arrays_SOX10_info_for_SupFig/"
+
+# read in the data:
+meth <- read.csv(paste0(working.dir, "SOX10_methylation_array_in_cell_lines_H016_20190720.csv"))
+gx <- read.csv(paste0(working.dir, "SOX10_gene_expression_in_cell_lines_H016_20190720.csv"))
+
+# load libraries
+library(ComplexHeatmap)
+
+# check data
+meth
+
+
+# generate heatmap:
+#
+# define colours for methylation heatmap with 0 - 1.0 beta vals:
+cols <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# produce matrix of heatmap values: take transverse
+mat <- as.matrix(t(meth[,-(1:3)]))
+colnames(mat) <- meth$probeID
+mat
+
+
+
+
+# produce heatmap:
+# use colours, titles, ...
+hm <- ComplexHeatmap::Heatmap( matrix=mat, col=cols, 
+  column_title="SOX10 locus methylation", name="Methylation (beta)", row_title=NULL,
+  cluster_rows=FALSE, cluster_columns=FALSE, show_row_names=TRUE, show_column_names=TRUE,
+  top_annotation=HeatmapAnnotation( TSS_distance=anno_text(meth$dist_TSS, rot=0), which="column",
+                             show_annotation_name=TRUE, annotation_name_side="left") )
+hm
+
+# output as pdf
+pdf( paste0( working.dir, Sys.Date(), "_450k_EPIC_cell_line_SOX10_probes_heatmap.pdf"), width=8, height=6)
+# move heatmap legend (beta scale) to right
+# move subtype prediction legend to left
+# add padding to bottom/left/top/right hand side
+ComplexHeatmap::draw( hm, heatmap_legend_side = "right", annotation_legend_side = "left")
+dev.off()
+
+
+
+# plot GX as barplots with SD:
+#
+# first do for the microarray data; coerce to a nice ggplot2-style thing
+gx.array <- data.frame(expression=as.numeric(gx[3,-1]), sample=colnames(gx)[-1])
+gx.array
+
+library(ggplot2)
+# barplot, use number as the plotted value
+p <- ggplot(data=gx.array, aes(x=sample, y=expression)) + geom_bar(stat="identity") +
+scale_x_discrete(limits=gx.array$sample) + # manually set order so it's the same as for the above
+ylab("Expression (microarray)") + theme_bw()
+p
+
+# output to pdf
+pdf( paste0( working.dir, Sys.Date(), "_expression_microarray_cell_line_SOX10_expression.pdf"), width=8, height=6)
+p
+dev.off()
+
