@@ -1,0 +1,144 @@
+#!/bin/R-3.1.2
+
+# superenhancers_subtype_01_prepare_data.Rscript
+# 20170418
+#
+# 20170718 - update for final H016 data and move to gbm-master-regulators git repo
+#
+# by Mike
+
+##############################
+#
+# WHAT THIS DOES
+#
+# For each GBM subtype:
+#	1) loads the per-sample enhancer calls (used as input for ROSE SE calling from Carl's pipeline)
+#	2) finds the 'enhancer union' = all enhancers in that subtype
+#	3) performs 'enhancer stitching' as per the Young lab protocol: regions within 12.5kbp are joined
+#
+# This stitched enhancer union is then used as the input regions for the subtype-wide SE analysis
+# 
+##############################
+
+##############################
+#
+# setup: load libs, definitions, etc.
+#
+##############################
+# load libs:
+suppressMessages(library(rtracklayer))
+suppressMessages(library(dplyr))
+#suppressMessages(library(Rsamtools))
+#suppressMessages(library(exomeCopy)) # for subdivideGRanges
+
+# output/analysis dir: define + create + set
+output.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/chipseq_superenhancers"
+system2("mkdir", output.dir)
+setwd(output.dir)
+
+# define path to the by-sample-id basedir for the ChIPseq data:
+path.chipseq <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/chipseq_newAlignments/wgs_bowtie" 
+
+# read in sample metadata:
+# use RDS object with many metadata:
+metadata <- readRDS("/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/WGBS_final_cohort/metadata/HIPO016_GBM_subtyping_FINAL_20170628.rds")
+# sort metadata by AK ID (it should be already but just in case)
+metadata <- metadata[ order(metadata$ak_id), ]
+
+# define bp distance to stitch enhancers
+# everyone uses 12.5kbp so use that:
+stitch.dist <- 12500
+
+# get list of sample IDs from chipseq dir
+# grep for AK*
+sample.ids <- list.files(path.chipseq)[ grep(x=list.files(path.chipseq), pattern="^AK") ] 
+
+# now: filter metadata obj only for these AK IDs:
+metadata <- metadata[ metadata$ak_id %in% sample.ids, ]
+
+##############################
+#
+# start code: run analysis for each subtype
+#
+##############################
+for( subtype in c("IDH","MES","RTK_I","RTK_II"))
+{
+	message(paste("Finding enhancer union for:", subtype))
+	
+	# sample IDs to analyse, from this subtype:
+	samples <- metadata$ak_id[ metadata$subtype_final==subtype ]
+
+	##############################
+	#
+	# first: read in enhancers for this subtype:
+	#
+	##############################
+	# example path:
+	# /icgc/dkfzlsdf/analysis/hipo/hipo_016/chipseq_newAlignments/wgs_bowtie/AK066/H3K27ac/SE/rose/AK066_H3K27ac_peaks.bed
+	#
+	# so: build paths for each sample's file, then load as a GRangesList:
+	path.enh.samples <- paste( path.chipseq, "/", samples, "/H3K27ac/SE/rose/", samples, "_H3K27ac_peaks.bed", sep="" )
+	
+	# read in BED files
+	# as they have non-standard columns (causes rtracklayer fits), just read in the chrom/start/end columns using read.table
+	# and then return a GRanges object with the regions; don't keep per-sample IDs (as will reduce the GRs shortly anyway)
+	# function to do so:
+	load.peak.as.gr <- function( bedfile )
+	{
+		# read in file: take first 3 columns (chr/start/end) only, pass colnames
+		d <- read.table(file=bedfile, header=F, sep="\t" )[,1:3]
+		
+		# set up + return GR
+		gr <- GRanges( seqnames=d[,1], ranges=IRanges(d[,2], d[,3]) )
+		return(gr)
+	}
+	enh.samples <- GRangesList(lapply( X=path.enh.samples, FUN=load.peak.as.gr ))
+
+	# now: reduce the enh calls per-sample to a "union" across the subtype:
+	#
+	# STITCHING HERE: also join enhancers if they're within the stitching distance defined above
+	enh.union <- reduce( unlist(enh.samples), drop.empty.ranges=T, min.gapwidth=stitch.dist )
+	
+	# add names to this - need names column (=col4) in bed output
+	names(enh.union) <- paste( subtype, "enhancer", 1:length(enh.union), sep="_" )
+	
+	# some chrM peaks have ranges with start = 0 (maybe end also?)
+	# which causes bedtools to freak out; so set this to 1
+	start(enh.union)[ start(enh.union) == 0 ] <- 1
+	end(enh.union)[ end(enh.union) == 0 ] <- 1
+	
+	# also: need to calculate #stitched loci ("NUM_LOCI") and length in bp of enh loci within stitched enh ("CONSTITUENT_SIZE")
+	#
+	# for NUM_LOCI: find overlaps; take subject hit vector, use table() to get #hits per subject GR + as.numeric to coerce to numeric
+	mcols(enh.union)$NUM_LOCI <- as.numeric( table( findOverlaps( query=unlist(enh.samples), subject=enh.union, ignore.strand=T )@subjectHits ) )
+	
+	# for CONSTITUENT_SIZE:
+	# need to reduce but NOT stitch loci - then can compare to stitched to find #input bp relative to stitched bp
+	enh.unstitched <- reduce( unlist(enh.samples), drop.empty.ranges=T )
+	# find overlaps vs stitched:
+	olap <- findOverlaps( query=enh.unstitched, subject=enh.union, ignore.strand=T ) 
+	# add width of query regions to the olap df:
+	olap <- as.data.frame(olap) # coerce to df for ease of use
+	olap$queryWidth <- width(enh.unstitched)[ olap$queryHits ]
+	# use dplyr: for each subject region, sum up width of query hits and then calculate length of input loci relative to stitched locus
+	olap.bysubject <- group_by( olap, subjectHits )
+	olap.bysubject <- summarise(olap.bysubject, querySum = sum(queryWidth) )
+	# for any region with input region sum length larger than output stitched region (!), set to the stitched region value:
+	olap.bysubject$querySum[olap.bysubject$querySum > olap.bysubject$subjectWidth] <- olap.bysubject$subjectWidth[olap.bysubject$querySum > olap.bysubject$subjectWidth]
+	# then the querySum = "constituent size"!
+	mcols(enh.union)$CONSTITUENT_SIZE <- olap.bysubject$querySum
+	
+	# add in region name also:
+	mcols(enh.union)$name <- names(enh.union)
+	
+	# and save output:
+	outputname <- paste( subtype, "_subtype_enhancer_union_", stitch.dist, "_stitched.bed", sep="" )
+	write.table( as.data.frame(enh.union), file=outputname, quote=F, sep="\t", row.names=F )
+}
+
+##############################
+# save session info (just in case):
+##############################
+# output session info
+seshinf <- paste ( Sys.Date(), "_superenhancers_01_prepare_data_sessionInfo.txt", sep="" )
+writeLines( capture.output(sessionInfo()), seshinf )

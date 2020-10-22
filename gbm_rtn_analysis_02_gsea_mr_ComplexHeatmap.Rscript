@@ -1,0 +1,931 @@
+#!/bin/R-3.4.3
+
+# gbm_rtn_analysis_02_gsea_mr_ComplexHeatmap.Rscript
+#
+# v10 20190806 - AK088 rerun; add in code for CRC+RTN consensus figs, from ipynb 20180806
+# v9 20180702 - major cleanup, remove CIMPneg analyses, tidy up outputs
+# v8 20180426 - change selected MRs in heatmap, output selected MRs for network graph, output lists of input TFs also
+# v6 20180111 - update for R v3.4.3, clean up code, output cs table of GSEA2 results for consensus MRs
+# v5 20170928 - generate heatmaps for manuscript figure panels
+# v4 20170221 - include HIPO016 TNI, generate more output heatmaps
+# v3 20161115 - generate more complex heatmap, switch to using Zuguang's ComplexHeatmap package
+# v2 20160927 - update to take consensus MRs from test/validation cohorts using 2tail GSEA statistics
+# 20160909
+#
+# RTN gene regulatory network analysis of GBMs using GX microarray data
+# part2: generate heatmap of consensus MRs showing differential activity between subtypes
+#
+# n.b. "consensus" MRs here mean MRs identified as significant in the 2-tail GSEA in both
+# the test and validation cohorts
+#
+# by Mike
+
+####################
+#
+# SETUP
+# working dir, load libs, load data...
+#
+####################
+#
+# source common code for the GBM RTN analysis: 
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+#
+# load libraries
+suppressMessages( library(RTN) )
+suppressMessages( library(gplots) )
+suppressMessages( library(limma) )
+# heatmap colours
+suppressMessages( library(marray) )
+# load libraries for Zuguang's EnrichedHeatmap package
+suppressMessages( library(ComplexHeatmap) )
+suppressMessages( library(circlize) )
+suppressMessages( library(EnrichedHeatmap) )
+suppressMessages( library(GetoptLong) )
+# load saved Renv from end of rtn script:
+message("Loading saved RTN Renv (may take some time)...")
+load(list.files()[ grep( x=list.files(), pattern="_combined_GBM_RTN_Renv.Rdata" ) ])
+
+# re-source common code for the GBM RTN analysis (in case load Renv loads old code)
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+
+# create new output dir for heatmaps:
+system2("mkdir", "./res_mr_heatmaps/")
+
+# read in sample metadata for full dataset, not just tumours:
+# lives in /icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/WGBS_final_cohort/metadata/HIPO016_GBM_subtyping_FINAL_20170628.rds
+metadata.all <- readRDS(path.metadata.rds)
+
+#############################################
+#
+# 1. first: get all sig. MRs in 2-tail gsea for test+valid cohorts, so can re-run the 2-tail GSEA for all sig. MRs in all subtypes/cohorts
+#
+#############################################
+#
+# do for each separate TNA analysis and combine into single vector taking unique hits
+# take unique MR IDs only
+gsea.tfs <- unique( c( get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation ),
+	get.consensus.mrs( rtna.idh.test, rtna.idh.validation ),
+	get.consensus.mrs( rtna.mes.test, rtna.mes.validation ),
+	get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+	) )
+
+#############################################
+#
+# 2. next: need to calculate enrichment scores for ALL the consensus MRs across all subtypes/cohorts
+#
+#############################################
+message("Calculating enrichment scores for consensus MRs in all networks...")
+# re-run the 2-tail gsea on the rtna objs
+# for both test+validation cohorts
+# 
+# other options:
+# use pValueCutoff=1 to keep all results
+# use stepFilter=F to not filter 
+# use tfs=gsea.tfs to calculate for these MRs specifically
+# no need to do permuations because we're not interested in the pvals, just want the enrichment scores!
+rtna.consensusGSEA.idh.test <- tna.gsea2( rtna.idh.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.mes.test <- tna.gsea2( rtna.mes.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtki.test <- tna.gsea2( rtna.rtki.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtkii.test <- tna.gsea2( rtna.rtkii.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.idh.validation <- tna.gsea2( rtna.idh.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.mes.validation <- tna.gsea2( rtna.mes.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtki.validation <- tna.gsea2( rtna.rtki.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtkii.validation <- tna.gsea2( rtna.rtkii.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+# HIPO016 TNI
+rtna.consensusGSEA.idh.hipo016 <- tna.gsea2( rtna.idh.hipo016, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.mes.hipo016 <- tna.gsea2( rtna.mes.hipo016, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtki.hipo016 <- tna.gsea2( rtna.rtki.hipo016, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtkii.hipo016 <- tna.gsea2( rtna.rtkii.hipo016, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+
+# generate output matrix for input into plotting heatmaps
+#
+# want to plot the *differential* scores, of course (showing the calculated activation/repression of a
+# given regulon in a particular subtype/cohort)
+#
+# order alphabetically so that the rownames match across all TNAs
+gsea.res <- cbind( 
+	rtna.consensusGSEA.idh.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.idh.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.idh.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.idh.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.mes.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.mes.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.mes.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.mes.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtki.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtki.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtki.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtki.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtkii.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtkii.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtkii.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtkii.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ]
+	)
+
+# add rownames based on alphabetical ordering, as used in cbind...
+rownames(gsea.res) <- rtna.consensusGSEA.idh.test@results$GSEA2.results$differential$Regulon[ order(rtna.consensusGSEA.idh.test@results$GSEA2.results$differential$Regulon) ]
+
+# next: add HIPO016 results (not all TFs in above also present here!)
+# match based on MR name
+gsea.res <- cbind( gsea.res,
+	rtna.consensusGSEA.idh.hipo016@results$GSEA2.results$differential$Observed.Score[ match( rownames(gsea.res), rtna.consensusGSEA.idh.hipo016@results$GSEA2.results$differential$Regulon ) ],
+	rtna.consensusGSEA.mes.hipo016@results$GSEA2.results$differential$Observed.Score[ match( rownames(gsea.res), rtna.consensusGSEA.mes.hipo016@results$GSEA2.results$differential$Regulon ) ],
+	rtna.consensusGSEA.rtki.hipo016@results$GSEA2.results$differential$Observed.Score[ match( rownames(gsea.res), rtna.consensusGSEA.rtki.hipo016@results$GSEA2.results$differential$Regulon ) ],
+	rtna.consensusGSEA.rtkii.hipo016@results$GSEA2.results$differential$Observed.Score[ match( rownames(gsea.res), rtna.consensusGSEA.rtkii.hipo016@results$GSEA2.results$differential$Regulon ) ]
+	)
+
+# add column and row names	
+# colnames based on cbind() above
+colnames(gsea.res) <- c( 
+		"IDH - test", "IDH - validation",
+		"MES - test", "MES - validation",
+		"RTK_I - test", "RTK_I - validation", 
+		"RTK_II - test", "RTK_II - validation",	
+		"IDH - HIPO016", "MES - HIPO016", "RTK_I - HIPO016", "RTK_II - HIPO016"
+		)
+
+# reorder columns alphabetically (for later heatmap display) 
+gsea.res <- gsea.res[ , order( colnames(gsea.res) ) ]
+
+###############
+# also: generate matrix to use as significance heatmap
+# plot as 2nd heatmap 
+#
+# here: want to find all the MRs significant within a subtype/cohort
+###############
+# first: match all subtype/cohort-significant MRs with rownames in the results matrix
+# 
+# construct a 2nd matrix of these logical vectors
+gsea.res.cellnotes <- cbind( rownames(gsea.res) %in% rtna.idh.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.idh.validation@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.idh.hipo016@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.mes.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.mes.validation@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.mes.hipo016@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtki.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtki.validation@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtki.hipo016@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtkii.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtkii.validation@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtkii.hipo016@results$GSEA2.results$differential$Regulon
+)
+# add column and row names	
+# colnames based on cbind() above
+colnames(gsea.res.cellnotes) <- c( 
+	"IDH - test", "IDH - validation", "IDH - HIPO016",
+	"MES - test", "MES - validation", "MES - HIPO016",
+	"RTK_I - test", "RTK_I - validation", "RTK_I - HIPO016",
+	"RTK_II - test", "RTK_II - validation", "RTK_II - HIPO016"
+	)
+# reorder columns alphabetically		
+gsea.res.cellnotes <- gsea.res.cellnotes[ , order( colnames(gsea.res.cellnotes) ) ]
+	
+# add rownames from gsea.res
+rownames(gsea.res.cellnotes) <- rownames(gsea.res)
+# now: replace T/F false values with text labels: "non-significant" or "significant"
+gsea.res.cellnotes[ gsea.res.cellnotes == TRUE ] <- "significant"
+# has been coerced to character matrix so now match on characters
+gsea.res.cellnotes[ gsea.res.cellnotes == "FALSE" ] <- "non-significant"
+
+###############
+# finally: find GX values for each MR 
+# plot as 3rd heatmap 
+#
+# here: want to find all the MRs significant within a subtype/cohort
+###############
+message("Look up GX values for each MR...")
+# first, get annotation df with gene symbols + ENSG IDs
+suppressMessages( library(hthgu133a.db) )
+anno <- merge( x=as.data.frame( hthgu133aENSEMBL ), y=as.data.frame( hthgu133aSYMBOL ), all=T )
+# now get only the rows matching our consensus MRs
+# drop probe_ids and take unique rows only
+anno <- unique( anno[ anno$symbol %in% rownames(gsea.res), c("ensembl_id", "symbol") ] )
+
+# clean up anno df:
+# remove rows with ENSG IDs not in the expression matrix
+anno <- anno[ !is.na( pmatch( anno$ensembl_id, rownames(expr) ) ), ]
+# remove 2nd BACH1 ENSG ID - it's a fricken intronic lncRNA, sigh
+anno <- anno[ anno$ensembl_id!="ENSG00000248476", ]
+
+# use the ENSG IDs to look up the MR GX values from the pre-loaded 'expr' HIPO016 GX matrix
+# (see gbm_rtn_analysis_common.R)
+mr.gx <- expr[ pmatch(anno$ensembl_id, rownames(expr) ), ]
+# transform to log2 (rpkm+1)
+mr.gx <- log2(mr.gx+1)
+# remove total_brain sample from here - not used
+mr.gx <- mr.gx[ , colnames(mr.gx)!="total_brain" ]
+
+# summarise MR GX for each subtype, including normals
+# build into new dataframe
+mr.gx.summary <- data.frame(
+	IDH = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="IDH"] ] ),
+	MES = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="MES"] ] ),
+	RTK_I = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="RTK_I"] ] ),
+	RTK_II = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="RTK_II"] ] ),
+	normal = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="normal"] ] )
+	)
+# replace rownames (ENSG IDs) with symbols
+rownames(mr.gx.summary)[ pmatch( x=anno$ensembl_id, table=rownames(mr.gx.summary) ) ] <- anno$symbol
+# reorder df so it's in the same order as the gsea.res df	
+mr.gx.summary <- mr.gx.summary[ match( rownames(gsea.res), rownames(mr.gx.summary) ), ]
+
+#############################################
+#
+# 3. generate output plots
+#
+# within each, plot 3 heatmaps:
+#	(i) differential enrichment scores
+#	(ii) significance 
+#	(iii) MR GX in HIPO016 samples
+#
+#############################################
+message("Generating output plots!")
+####################
+#
+# a) plot full set of consensus MRs for test+validation cohorts - combined 4-subtype - test+validation+HIPO016 results
+#
+####################
+heatmap.consensus.mrs( gsea.res=gsea.res, 
+	gsea.res.cellnotes=gsea.res.cellnotes, 
+	mr.gx.summary=mr.gx.summary, 
+	outputprefix=paste( "res_mr_heatmaps/", Sys.Date(), "_combined_GBM_RTN_2-tail_GSEA_consensus_results_summary_heatmap_all", sep="" ) 
+	)
+
+#####
+# for HIPO016: need to remove NAs from Heatmap input data for MRs
+# filter for HIPO016 columns
+#####
+gsea.res.hipo016 <- gsea.res[ !is.na(gsea.res[,"IDH - HIPO016"]), grepl("HIPO016", x=colnames(gsea.res)) ]
+# get matching rows by MR, HIPO016 cols
+gsea.res.cellnotes.hipo016 <- gsea.res.cellnotes[ rownames(gsea.res.cellnotes) %in% rownames(gsea.res.hipo016), grepl("HIPO016", x=colnames(gsea.res.cellnotes)) ]
+# get MR GX matching rows by MR
+mr.gx.summary.hipo016 <- mr.gx.summary[ rownames(mr.gx.summary) %in% rownames(gsea.res.hipo016), ]
+
+# g) plot for test+validation cohorts - combined 4-subtype - HIPO016 results
+heatmap.consensus.mrs( gsea.res=gsea.res.hipo016, gsea.res.cellnotes=gsea.res.cellnotes.hipo016, mr.gx.summary=mr.gx.summary.hipo016, 
+	outputprefix=paste( "res_mr_heatmaps/", Sys.Date(), "_combined_GBM_RTN_2-tail_GSEA_consensus_results_summary_heatmap_HIPO016_cohort_all", sep="" ) 
+	)
+
+#######################
+#
+# 4. generate manuscript figures:
+# barplots of RTK_I MR absolute GX in each subtype
+#
+#######################
+message("Generating manuscript figure panels!")
+# build a plot df for ggplot2 with following columns:
+# mr = RTK I MR
+# subtype = subtypes (GBM + normal)
+n.subtype <- 5
+subtypes <- c("IDH", "MES", "RTK_I", "RTK_II", "normal")
+# rpkm = TPM value for that target (ie the TF itself)
+#
+# generate plot df
+#
+# look up the TPMs in the mr.gx.summary df created above:
+plot.data <- data.frame(
+  mr = rep("SOX10", n.subtype),
+  subtype = rep(subtypes, 1),
+  target = rep("TF", n.subtype),
+  rpkm = as.numeric(t(mr.gx.summary[rownames(mr.gx.summary)=="SOX10",]))  
+)
+
+# define consensus RTK_I T/V MRs
+mrs.rtki <- get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+
+# loop over all the RTK I MRs, less SOX10:
+for( mr in mrs.rtki[mrs.rtki!="SOX10"] )
+{  
+    # generate plot df, add to previous 
+    df <- data.frame(
+      mr = rep(mr, n.subtype),
+      subtype = rep(subtypes, 1),
+      target = rep("TF", n.subtype),
+      rpkm = as.numeric(t(mr.gx.summary[rownames(mr.gx.summary)==mr,]))  
+     )
+    
+    # add to the plot.data df
+    plot.data <- rbind( plot.data, df )
+}
+
+# refactor levels so can use in plotting ordered as desired...
+#plot.data$target <- factor( plot.data$target, levels=c("TF", "targets") )
+plot.data$subtype <- factor( plot.data$subtype, levels=c("IDH","MES","RTK_I","RTK_II","normal") )
+plot.data$mr <- factor( plot.data$mr, levels=levels(plot.data$mr)[ order(levels(plot.data$mr)) ] )
+
+# for plot:
+# define colours for subtypes, as named vector:
+subtype.colours <- c(IDH="#e41a1c", MES="#377eb8", RTK_I="#4daf4a", RTK_II="#984ea3", normal="orange")
+
+# generate ggplot2 obj
+suppressMessages( library(ggplot2) )
+g <- ggplot( plot.data, aes(x=target, y=rpkm, fill=subtype) ) + 
+geom_bar(position="dodge", stat="identity") + # don't stack bars, use y values
+facet_grid( mr ~ ., scales="free_y" ) + # facet by MR, use free y-axis
+scale_fill_manual(values=subtype.colours) + # fill with manual colours
+xlab(NULL) + ylab("log2(TPM + 1)") # change x/y-axis labels
+
+# output
+outputname <- paste0( "./res_mr_heatmaps/GBM_RTN_analysis_RTK_I_MRs_GX_plots_", Sys.Date(), ".pdf" )
+pdf(outputname, height=14, width=3)
+g
+dev.off()
+
+#####
+# output clean version of figure for manuscript figure:
+#
+# generate plot obj
+g <- ggplot( plot.data, aes(x=target, y=rpkm, fill=subtype) ) + 
+geom_bar(position="dodge", stat="identity") + # don't stack bars, use y values
+facet_grid( mr ~ ., scales="free_y" ) + # facet by MR, use free y-axis
+scale_fill_manual(values=subtype.colours) + # fill with manual colours
+xlab(NULL) + ylab("log2(TPM + 1)") + # change x/y-axis labels
+theme_bw() + # change theme to black and white
+# decrease y-axis label and tick label font size, remove panel border,
+theme(axis.title.y = element_text(size=rel(0.7)), axis.text.y = element_text(size=rel(0.7)), panel.border=element_blank() ) +
+# decrease facet strip text size, remove facet strip background, remove x-axis tick mark labels and the x-axis tick marks:
+theme(strip.text=element_text(size=rel(0.60)), strip.background=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank() ) +
+guides(fill=FALSE) # remove legend
+# output as pdf:
+outputname <- paste0( "./res_mr_heatmaps/ManuscriptFigure_5_GBM_RTN_analysis_RTK_I_MRs_GX_plots_", Sys.Date(), "_logFC.pdf" )
+pdf(outputname, height=10, width=2)
+g
+dev.off()
+# output as png:
+outputname <- paste0( "./res_mr_heatmaps/ManuscriptFigure_5_GBM_RTN_analysis_RTK_I_MRs_GX_plots_", Sys.Date(), "_logFC.png" )
+png(outputname, height=1000, width=200, bg="transparent")
+g
+dev.off()
+
+##############################################
+#
+# 5. generate heatmaps for manuscript figures
+#
+# do for following sets of MRs:
+# 1. RTK_I MRs only in T+V; 
+# 2. selected MRs in all 4 subtypes in T+V; 
+# 3. all T+V 4sub MRs in T+V;
+# 4. all T+V+HIPO 4sub MRs.
+#
+# also change to previous heatmaps:
+# - add heatmap annotations showing the subtype and cohort for each
+#
+##############################################
+# colours for diffES heatmap
+cols <- colorRamp2( breaks=c(-3,0,3), colors=c("blue", "white", "red") )
+########### 
+# 
+# first: do for the consensus RTK_I MRs, T+V
+#
+###########
+# get symbols of RTK_I MRs (use as above)
+mrs.rtki <- get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+# get column indices for this: as per above colnames of gsea.res, drop HIPO016
+keep.cols <- !grepl( "HIPO016", colnames(gsea.res) )
+# extract the relevant rows (=MRs) and columns (=T+V, 4sub) from gsea.res
+mat.rtki.gsea <- gsea.res[ rownames(gsea.res) %in% mrs.rtki, keep.cols ]
+# now generate column annotations for this heatmap:
+ha.top <- columnAnnotation(
+  df=data.frame( subtype=c("IDH","IDH","MES","MES","RTK_I","RTK_I","RTK_II","RTK_II"),
+                 cohort=c("A","B","A","B","A","B","A","B")
+               ),
+  col=list(
+      subtype=subtype.colours,
+      cohort=c("A"="black","B"="white")
+    )  
+)
+# generate heatmap obj
+p <- Heatmap( mat.rtki.gsea, col=cols, name="2-tail GSEA differential ES", 
+              width=unit(6, "cm"), cluster_columns=FALSE, cluster_rows=TRUE,
+              column_title="2-tail GSEA\ndifferential enrichment score", 
+              show_row_dend=FALSE,
+              show_row_names=TRUE, column_title_gp = gpar(fontsize = 10),
+              show_column_names=FALSE, top_annotation=ha.top )
+# output as PDF: 
+outputprefix <- paste0( "./res_mr_heatmaps/ManuscriptFigure_5_GBM_RTN_analysis_RTK_I_MRs_GSEAres_heatmap_", Sys.Date() )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=10, height=10)
+print(p)
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- paste( outputprefix, "png", sep="." )
+# open plotting device
+png(file=outputname, width=10*ppi, height=10*ppi, res=ppi)
+print(p)
+dev.off()
+
+########### 
+# 
+# second: do for selected MRs, T+V
+#
+# split heatmap up based on subtype classification of the selected MRs
+#
+###########
+# define symbols of MRs of interest:
+# this is hardcoded but they ARE seleted by the following criteria:
+#	1) consensus MRs (adj pval < 0.01 in both A+B networks)
+#	2) calculate mean dES, rank by that, take positive dES TFs
+#	3) take the top 8 for each subtype (as RTK_I has only 8!)
+#
+# unique MRs (with biological prior knowledge and/or appearing in other analyses)
+# IDH: BMP2, ZNF248, ZNF609, MYCN, VAX2, ZNF74, RBPJ
+# MES: CEBPB, BNC2, FOSL1, SNAI2, FOSL2, ZNF394, MAFB
+# RTK_I: BCL11A, NR0B1, SOX10, ZFPM2, DLX5, ONECUT2, MYT1L
+# RTK_II: MEOX2, ZNF134, ETV5, CREB3L1, POU3F2, GLI2
+#
+# shared MRs 
+# IDH/RTK I: MYT1
+# MES/RTK II: NR2E1, ZNF217
+#
+# build df with columns of (1) MR name (2) MR classification (to split heatmap rows)
+mrs.keep <- data.frame(
+				symbol=c( "BMP2", "ZNF248", "ZNF609", "MYCN", "VAX2", "ZNF74", "RBPJ", # IDH
+						"CEBPB", "BNC2", "FOSL1", "SNAI2", "FOSL2", "ZNF394", "MAFB", # MES
+						"BCL11A", "NR0B1", "SOX10", "ZFPM2", "DLX5", "ONECUT2", "MYT1L", # RTK I
+						"MEOX2", "ZNF134", "ETV5", "CREB3L1", "POU3F2", "GLI2", # RTK II
+						"MYT1", # IDH/RTK I
+	 				    "NR2E1", "ZNF217" ), # MES/RTK II
+				split=c(rep("IDH", 7),
+						rep("MES", 7),
+						rep("RTK I", 7),
+						rep("RTK II", 6),
+						rep("IDH/RTK I", 1),
+						rep("MES/RTK II", 2) ), stringsAsFactors=F
+			)
+			
+# get column indices for this: as per above colnames of gsea.res
+keep.cols <- !grepl( "HIPO016", colnames(gsea.res) )
+			  
+# extract the relevant rows (=MRs) and columns (=T+V, 4sub) from gsea.res
+mat.select.gsea <- gsea.res[ rownames(gsea.res) %in% mrs.keep$symbol, keep.cols ]
+
+# to label cells: need to set up matrix of significant consensus MRs, labelled with * (sig) or blank (not sig)
+mat.select.gsea.sig <- as.matrix(mat.select.gsea)
+# do for first 2 cols = IDH
+mat.select.gsea.sig[,1] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.idh.test, rtna.idh.validation )
+mat.select.gsea.sig[,2] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.idh.test, rtna.idh.validation )
+# do for MES, RTK_I, RTK_II for each pair of cols in turn
+mat.select.gsea.sig[,3] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.mes.test, rtna.mes.validation )
+mat.select.gsea.sig[,4] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.mes.test, rtna.mes.validation )
+mat.select.gsea.sig[,5] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+mat.select.gsea.sig[,6] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+mat.select.gsea.sig[,7] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+mat.select.gsea.sig[,8] <- rownames(mat.select.gsea.sig) %in% get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+# coerce all 0s to blank, 1s to "*"
+mat.select.gsea.sig[ mat.select.gsea.sig==0 ] <- ""
+mat.select.gsea.sig[ mat.select.gsea.sig==1 ] <- "*"
+
+# reorder mrs.keep df by gene symbol, so that it matches the order of the heatmap input matrix:
+mrs.keep <- mrs.keep[ match(rownames(mat.select.gsea), mrs.keep$symbol), ]
+
+# use same top annotation for this heatmap as previous
+#
+# generate heatmap obj
+# label cells based on lookup in above matrix
+p <- Heatmap( mat.select.gsea, col=cols, name="2-tail GSEA differential ES", 
+              cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.text( label=mat.select.gsea.sig[i,j], x = x, y = y )
+                },
+			  split=mrs.keep$split, # split by MR classification	
+              width=unit(6, "cm"), cluster_columns=FALSE, cluster_rows=TRUE,
+              column_title="2-tail GSEA\ndifferential enrichment score", 
+              show_row_dend=FALSE,             
+              show_row_names=TRUE, column_title_gp = gpar(fontsize = 8),
+              show_column_names=FALSE, top_annotation=ha.top )
+# output as PDF: 
+outputprefix <- paste0( "./res_mr_heatmaps/ManuscriptFigure_5_GBM_RTN_analysis_selected_MRs_GSEAres_heatmap_", Sys.Date() )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=10, height=10)
+print(p)
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- paste( outputprefix, "png", sep="." )
+# open plotting device
+png(file=outputname, width=10*ppi, height=10*ppi, res=ppi)
+print(p)
+dev.off()
+
+###########
+#
+# for these selected MRs: also output assoc. maps to generate network graphs for figures.
+#
+###########
+# both test/validation networks
+# use quantile filtering with standard cutoff
+test.graph <- tni.graph( object=rtni.test, tnet="dpi", gtype="amap", amapFilter="quantile", tfs=mrs.keep$symbol )
+validation.graph <- tni.graph( object=rtni.validation, tnet="dpi", gtype="amap", amapFilter="quantile", tfs=mrs.keep$symbol )
+
+# save:
+outputname <- paste0( Sys.Date(), "_RTN_GBM_igraph_objects_selected_MRs_network_graph.Rdata" )
+save( test.graph, validation.graph, file=outputname )
+
+########### 
+# 
+# third: do for all sig consensus MRs in T+V
+#
+###########
+# define MRs to keep:
+# use vector gsea.tfs - this is all consensus MRs in T+V cohorts
+#
+# get column indices for this: as per above colnames of gsea.res
+keep.cols <- !grepl( "HIPO016", colnames(gsea.res) )
+# extract the relevant rows (=MRs) and columns (=T+V, 4sub) from gsea.res
+mat.tv.gsea <- gsea.res[ rownames(gsea.res) %in% gsea.tfs, keep.cols ]
+#
+# to label cells: need to set up matrix of significant consensus MRs, labelled with * (sig) or blank (not sig)
+mat.tv.gsea.sig <- as.matrix(mat.tv.gsea)
+# do for first 2 cols = IDH
+mat.tv.gsea.sig[,1] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.idh.test, rtna.idh.validation )
+mat.tv.gsea.sig[,2] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.idh.test, rtna.idh.validation )
+# do for MES, RTK_I, RTK_II for each pair of cols in turn
+mat.tv.gsea.sig[,3] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.mes.test, rtna.mes.validation )
+mat.tv.gsea.sig[,4] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.mes.test, rtna.mes.validation )
+mat.tv.gsea.sig[,5] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+mat.tv.gsea.sig[,6] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+mat.tv.gsea.sig[,7] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+mat.tv.gsea.sig[,8] <- rownames(mat.tv.gsea.sig) %in% get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+# coerce all 0s to blank, 1s to "*"
+mat.tv.gsea.sig[ mat.tv.gsea.sig==0 ] <- ""
+mat.tv.gsea.sig[ mat.tv.gsea.sig==1 ] <- "*"
+
+# use same top annotation for this heatmap as previous
+#
+# generate heatmap obj
+# label cells based on lookup in above matrix
+p <- Heatmap( mat.tv.gsea, col=cols, name="2-tail GSEA differential ES", 
+              cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.text( label=mat.tv.gsea.sig[i,j], x = x, y = (y-unit(0.0025, "npc"))) # for output pdf size, need to move the y-coord down
+                },
+              width=unit(6, "cm"), cluster_columns=FALSE, cluster_rows=TRUE,
+              column_title="2-tail GSEA\ndifferential enrichment score", 
+              show_row_names=TRUE, row_names_gp = gpar(fontsize=8),
+			  column_title_gp = gpar(fontsize = 10),
+              show_column_names=FALSE, top_annotation=ha.top )
+# output as PDF: 
+outputprefix <- paste0( "./res_mr_heatmaps/ManuscriptFigure_5_GBM_RTN_analysis_all_T_V_MRs_GSEAres_heatmap_", Sys.Date() )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=10, height=15)
+print(p)
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- paste( outputprefix, "png", sep="." )
+# open plotting device
+png(file=outputname, width=10*ppi, height=10*ppi, res=ppi)
+print(p)
+dev.off()
+
+########### 
+# 
+# finally: do for all sig consensus MRs in T+V, include the HIPO016 results also
+#
+###########
+# define MRs to keep:
+# use vector gsea.tfs.4subtype - this is all consensus MRs in T+V cohorts
+#
+# get column indices for this: as per above colnames of gsea.res
+keep.cols <- 1:12
+# extract the relevant rows (=MRs) and columns (=T+V, 4sub) from gsea.res
+mat.tvh.gsea <- gsea.res[ rownames(gsea.res) %in% gsea.tfs, keep.cols ]
+#
+# to label cells: need to set up matrix of significant consensus MRs, labelled with * (sig) or blank (not sig)
+mat.tvh.gsea.sig <- as.matrix(mat.tvh.gsea)
+# do for 2,3 cols = IDH, t+v
+mat.tvh.gsea.sig[,2] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.idh.test, rtna.idh.validation )
+mat.tvh.gsea.sig[,3] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.idh.test, rtna.idh.validation )
+# do for MES, RTK_I, RTK_II for each pair of cols in turn
+mat.tvh.gsea.sig[,5] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.mes.test, rtna.mes.validation )
+mat.tvh.gsea.sig[,6] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.mes.test, rtna.mes.validation )
+mat.tvh.gsea.sig[,8] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+mat.tvh.gsea.sig[,9] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )
+mat.tvh.gsea.sig[,11] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+mat.tvh.gsea.sig[,12] <- rownames(mat.tvh.gsea.sig) %in% get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+# for all columns with HIPO016 in title, set contents to 0 (don't need to show their significance here?)
+mat.tvh.gsea.sig[ , grepl(pattern="HIPO016", x=colnames(mat.tvh.gsea.sig)) ] <- 0
+# coerce all 0s to blank, 1s to "*"
+mat.tvh.gsea.sig[ mat.tvh.gsea.sig==0 ] <- ""
+mat.tvh.gsea.sig[ mat.tvh.gsea.sig==1 ] <- "*"
+
+# generate new top annotation for this heatmap, adding in HIPO016 net
+ha.top2 <- columnAnnotation(
+  df=data.frame( subtype=c("IDH","IDH","IDH","MES","MES","MES","RTK_I","RTK_I","RTK_I","RTK_II","RTK_II","RTK_II"),
+                 cohort=c("HIPO016","A","B","HIPO016","A","B","HIPO016","A","B","HIPO016","A","B")
+               ),
+  col=list(
+      subtype=subtype.colours,
+      cohort=c("HIPO016"="grey","A"="black","B"="white")
+    )  
+)
+
+# generate heatmap obj
+# label cells based on lookup in above matrix
+p <- Heatmap( mat.tvh.gsea, col=cols, name="2-tail GSEA differential ES", 
+              cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.text( label=mat.tvh.gsea.sig[i,j], x = x, y = (y-unit(0.0025, "npc"))) # for output pdf size, need to move the y-coord down
+                },
+              width=unit(6, "cm"), cluster_columns=FALSE, cluster_rows=TRUE,
+              column_title="2-tail GSEA\ndifferential enrichment score", 
+              show_row_names=TRUE, row_names_gp = gpar(fontsize=8),
+			  column_title_gp = gpar(fontsize = 10),
+              show_column_names=FALSE, top_annotation=ha.top2 )
+# output as PDF: 
+outputprefix <- paste0( "./res_mr_heatmaps/ManuscriptFigure_5_GBM_RTN_analysis_all_T_V_MRs_withHIPOnet_GSEAres_heatmap_", Sys.Date() )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=10, height=15)
+print(p)
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- paste( outputprefix, "png", sep="." )
+# open plotting device
+png(file=outputname, width=10*ppi, height=10*ppi, res=ppi)
+print(p)
+dev.off()
+
+#############################################
+#
+# 6. generate full results table for this analysis,
+# take gsea.res (with the differential ES for each network/signature already)
+# and add in other information for each network/signature: regulon size; pval; adj pval
+#
+#############################################
+# copy gsea.res object, then edit colnames, to strip spaces and add _diffEnrichScore:
+gsea.res.table <- as.data.frame(gsea.res)
+colnames(gsea.res.table) <- gsub( pattern=" - ", replacement="_", x=colnames(gsea.res.table))
+colnames(gsea.res.table) <- paste0( colnames(gsea.res.table), "_dES" )
+
+# now, for each subtype/network, add in additional information from the appropriate TNA obj
+for( subtype in c("idh", "mes", "rtki", "rtkii") )
+{
+	message(subtype)
+	for( network in c("test", "validation", "hipo016") )
+	{
+		message(network)
+		# get appropriate tna obj:
+		rtna <- get( paste0("rtna.", subtype, ".", network) )
+		# extract df with 2-tail gsea differential results
+		df <- rtna@results$GSEA2.results$differential
+		
+		# now: to gsea.res.table, add in the info based on matching rownames(=TF symbols), to appropriately named columns:
+		gsea.res.table[ , paste0( toupper(subtype), "_", network, "_", "regulonSize" ) ] <- df[ match(rownames(gsea.res.table), rownames(df)), "Regulon.Size" ]
+		gsea.res.table[ , paste0( toupper(subtype), "_", network, "_", "pval" ) ] <- df[ match(rownames(gsea.res.table), rownames(df)), "Pvalue" ]
+		gsea.res.table[ , paste0( toupper(subtype), "_", network, "_", "adjPval" ) ] <- df[ match(rownames(gsea.res.table), rownames(df)), "Adjusted.Pvalue" ]		
+	}
+}
+
+# clean up colnames for tidiness:
+# split RTKI/RTKII with underscore; replace hipo016 with uppercase.
+colnames(gsea.res.table) <- gsub( pattern="RTKI", replacement="RTK_I", x=colnames(gsea.res.table))
+colnames(gsea.res.table) <- gsub( pattern="hipo016", replacement="HIPO016", x=colnames(gsea.res.table))
+
+# sort by colnames:
+gsea.res.table <- gsea.res.table[ , order(colnames(gsea.res.table)) ]
+
+# then output table as csv:
+outputname <- paste0( Sys.Date(), "_RTN_GBM_Master_Regulator_Analysis_GSEA2_results_table.csv" )
+write.csv(x=gsea.res.table, file=outputname)
+
+#############################################
+#
+# 7. save + output lists of TFs present in the two networks
+# for use in other analyses
+#
+#############################################
+# these live in the @regulatoryElements slot of the TNI objects
+# generate a df and output:
+network.tfs <- data.frame(
+	hgnc_symbol=union( names(rtni.test@regulatoryElements), names(rtni.validation@regulatoryElements) )
+	)
+# add in cols for the networks, with the array probeID used
+# therefore if a TF is NOT in the network, will return NA
+network.tfs$network.A <- rtni.test@regulatoryElements[ match( network.tfs$hgnc_symbol, names(rtni.test@regulatoryElements) ) ]	
+network.tfs$network.B <- rtni.validation@regulatoryElements[ match( network.tfs$hgnc_symbol, names(rtni.validation@regulatoryElements) ) ]	
+# write to file:
+outputname <- paste0( Sys.Date(), "_RTN_GBM_TFs_used_in_networks_A_and_B.csv" )
+write.csv(x=network.tfs, file=outputname)
+
+#############################################
+#
+# 8. overlap with CRC MRs and find consensus
+# output figs
+#
+#############################################
+# other options/libs
+options(stringsAsFactors=F)
+
+# so: now: load the required TF lists.
+#
+# firstly: get CRC results table: (used in scRNAseq_Darmanis_pseudotime.Rscript)
+path <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/scRNAseq_Darmanis_2017/CRC_MRs_20190429.csv"
+# read in:
+# 2-column table with symbol and subtype
+res.crc <- read.csv(path)
+
+# read in RTN results table from current dir
+res.rtn <- read.csv(file=list.files()[grep(pattern="_RTN_GBM_Master_Regulator_Analysis_GSEA2_results_table.csv", x=list.files())])
+# now: filter only for those TFs that are adjpval < 0.01 in both T/V cohorts in same subtype:
+res.rtn <- res.rtn[ !is.na((res.rtn$IDH_test_adjPval < 0.01 & res.rtn$IDH_validation_adjPval < 0.01) | (res.rtn$MES_test_adjPval < 0.01 & res.rtn$MES_validation_adjPval < 0.01) | (res.rtn$RTK_I_test_adjPval < 0.01 & res.rtn$RTK_I_validation_adjPval < 0.01) | (res.rtn$RTK_II_test_adjPval < 0.01 & res.rtn$RTK_II_validation_adjPval < 0.01)), ]
+# should be 117
+
+# generate venn: first, generate matrix to pass to limma::vennCount
+#
+# build df with TF names, use all present:
+mat.olap.venn <- data.frame( tf=unique(c(res.rtn$X, res.crc$symbol)) )
+# populate test and validation columns based on matching symbols
+mat.olap.venn$GRN <- mat.olap.venn$tf %in% res.rtn$X
+mat.olap.venn$CRC <- mat.olap.venn$tf %in% res.crc$symbol
+# coerce T/F to 0,1 and pass the appropriate cols to vennCount
+mat.olap.venn[mat.olap.venn==TRUE] <- as.numeric(1)
+mat.olap.venn.counts <- vennCounts(x=mat.olap.venn[,c(2:3)])
+
+# get names in intersect
+res.common <- intersect( res.rtn$X, res.crc$symbol )
+#
+# want to colour manually:
+# CEBPA, FLI1, MAFB, MITF = MES
+# GLI2, TFCP2L1, SOX9, HES1 = RTK_II
+# MYCN = IDH
+# SOX10 = RTK_I
+
+# generate output venn diagram:
+outputname <- paste0( Sys.Date(), "_MR_analyses_consensus_GRN_vs_CRC_overlap_Venn.pdf" )
+pdf(outputname, height=10, width=10)
+par(bty="n")
+# use vennCounts output matrix
+# change text size
+# colour circles blue(GRN), yellow(CRC)
+# change margins around plot
+# add title, change title font size
+vennDiagram( mat.olap.venn.counts, cex=c(1,1,1), circle.col=c("blue", "yellow"), bty="n", mar=NULL )
+text(x=0, y=-1.75, labels="Consensus subtype MRs:", cex=0.8)
+text(x=-0.9, y=-1.95, labels=substitute(italic("MYCN")), cex=0.8, col=subtype.colours["IDH"])
+text(x=0.4, y=-1.95, labels=substitute(italic("CEBPA  FLI1  MAFB  MITF")), cex=0.8, col=subtype.colours["MES"])
+text(x=-0.8, y=-2.15, labels=substitute(italic("SOX10")), cex=0.8, col=subtype.colours["RTK_I"])
+text(x=0.4, y=-2.15, labels=substitute(italic("GLI2  HES1  SOX9  TFCP2L1")), cex=0.8, col=subtype.colours["RTK_II"])
+dev.off()
+
+
+########################################
+#
+# 8. plot GX of the CRC/GRN consensus MRs
+# code from ipynb 20180806
+#
+########################################
+# define labels: do for the 10 consensus MRs
+# want to colour manually:
+# CEBPA, FLI1, MAFB, MITF = MES
+# GLI2, HES1 TFCP2L1, SOX9 = RTK_II
+# MYCN = IDH
+# SOX10 = RTK_I
+consensus.mrs <- c("CEBPA","FLI1","HES1","MAFB","MITF","GLI2","TFCP2L1","SOX9","SOX10","MYCN")
+
+# look up the expression of these:
+###############
+# finally: find GX values for each MR 
+# plot as 3rd heatmap 
+#
+# here: want to find all the MRs significant within a subtype/cohort
+###############
+message("Look up GX values for each MR...")
+# first, get annotation df with gene symbols + ENSG IDs
+suppressMessages( library(hthgu133a.db) )
+anno <- merge( x=as.data.frame( hthgu133aENSEMBL ), y=as.data.frame( hthgu133aSYMBOL ), all=T )
+# now get only the rows matching our consensus MRs
+# drop probe_ids and take unique rows only
+anno <- unique( anno[ anno$symbol %in% consensus.mrs, c("ensembl_id", "symbol") ] )
+# reorder rows by consensus MR subtype, do so manually by indices
+anno <- anno[ c(7,2,4,3,9,6,8,5,1,10), ]
+
+# reload metadata - need normal data also.
+metadata <- readRDS(path.metadata.rds)
+# drop the 'exclude' samples
+metadata <- metadata[ metadata$subtype_final!="exclude", ]
+
+# use the ENSG IDs to look up the MR GX values from the pre-loaded 'expr' HIPO016 GX matrix
+# (see gbm_rtn_analysis_common.R)
+mr.gx <- expr[ pmatch(anno$ensembl_id, rownames(expr) ), ]
+# replace rownames with symbols
+rownames(mr.gx) <- anno$symbol
+# transform to log2 (TPM+1)
+mr.gx <- log2(mr.gx+1)
+# remove samples not in metadata
+mr.gx <- mr.gx[ , colnames(mr.gx) %in% metadata$ak_id ]
+# order columns by subtype
+mr.gx <- mr.gx[ , match( metadata$ak_id[order(metadata$subtype_final)], colnames(mr.gx) ) ]
+
+# make lovely heatmap!
+# generate column annos = match samples with subtype
+ha <- ComplexHeatmap::HeatmapAnnotation( 
+    df=data.frame(subtype=metadata$subtype_final[order(metadata$subtype_final)]), # reorder anno df according to column order above (!)
+    col=list( 
+		subtype=c( IDH="#e41a1c", MES="#377eb8", RTK_I="#4daf4a", RTK_II="#984ea3", normal="black" )
+    ),
+    na_col="black", show_annotation_name=FALSE, annotation_name_side="left"   
+ )
+# generate row annos = match MRs with subtype, based on order of row names (as defined manually above when reordering 'anno')
+ha.2 <- ComplexHeatmap::rowAnnotation( 
+    df=data.frame(subtype=c("IDH",rep("MES",4),"RTK_I",rep("RTK_II",4))), # reorder anno df according to column order above (!)
+    col=list( 
+		subtype=c( IDH="#e41a1c", MES="#377eb8", RTK_I="#4daf4a", RTK_II="#984ea3" )
+    ),
+    na_col="black", show_annotation_name=FALSE
+ )
+# generate heatmap obj
+p <- Heatmap( as.matrix(mr.gx), col=c("white","orange"), name="Consensus MR expression\nlog2(TPM+1)",
+                   cluster_rows=F, cluster_columns=F, column_names_gp=gpar(fontsize=5), row_names_gp=gpar(fontsize=8), 
+                   top_annotation=ha
+                   ) + ha.2
+
+# output as PDF: 
+# generate outputname, output to RTN analysis MR heatmap subdir
+outputname <- paste0("./res_mr_heatmaps/Consensus_CRC-GRN_MR_GX_", Sys.Date(), ".pdf")
+# open plotting device
+pdf(file=outputname, width=8, height=3)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- paste0("./res_mr_heatmaps/Consensus_CRC-GRN_MR_GX_", Sys.Date(), ".png")
+# open plotting device
+png(file=outputname, width=8*ppi, height=3*ppi, res=ppi)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+
+###############
+# do same, but for z-scores of GX
+###############
+# generate z-score log10(H327ac signal) matrices for plotting
+#
+# generate the scaled matrices: scale() each row, then take the transposed matrix 
+# need to re-add column names
+mr.gx.z <- t(apply( mr.gx, 1, scale ))
+colnames(mr.gx.z) <- colnames(mr.gx)
+############
+# colours for heatmaps
+############
+suppressMessages( library(RColorBrewer) )
+suppressMessages( library(circlize) )
+# need to define cols for z-score scale
+# use 3-color divergent purple-orange palette
+#
+# set breaks based on scaled H3K27ac matrix
+# range is -4 to 3.38 to go from -4 to 4 in  steps:
+#
+# use PuOr brewer palette but reversed (orange = high, purple = low)
+cols.z <- colorRamp2( breaks=c( min(mr.gx.z), -2, 0, 2, max(mr.gx.z) ), colors=rev(brewer.pal(5, "PuOr")) )
+
+# generate heatmap obj
+p <- Heatmap( as.matrix(mr.gx.z), col=cols.z, name="Consensus MR expression\nz-scores of log2(TPM+1)",
+                   cluster_rows=F, cluster_columns=F, column_names_gp=gpar(fontsize=5), row_names_gp=gpar(fontsize=8), 
+                   top_annotation=ha
+                   ) + ha.2
+
+# output as PDF: 
+# generate outputname, output to RTN analysis MR heatmap subdir
+outputname <- paste0("./res_mr_heatmaps/Consensus_CRC-GRN_MR_GX_z-scores_", Sys.Date(), ".pdf")
+# open plotting device
+pdf(file=outputname, width=8, height=3)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- paste0("./res_mr_heatmaps/Consensus_CRC-GRN_MR_GX_z-scores_", Sys.Date(), ".png")
+# open plotting device
+png(file=outputname, width=8*ppi, height=3*ppi, res=ppi)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+
+#############################################
+#
+# 9. save the R objects generated in this analysis
+# and output session info
+#
+#############################################
+message("Saving a copy of R objects and session info...")
+# save the R objs generated
+save( gsea.res, gsea.res.table, gsea.tfs, mrs.keep,
+	rtna.consensusGSEA.idh.test, rtna.consensusGSEA.mes.test, rtna.consensusGSEA.rtki.test, rtna.consensusGSEA.rtkii.test,
+	rtna.consensusGSEA.idh.validation, rtna.consensusGSEA.mes.validation, rtna.consensusGSEA.rtki.validation, rtna.consensusGSEA.rtkii.validation,
+	rtna.consensusGSEA.idh.hipo016, rtna.consensusGSEA.mes.hipo016, rtna.consensusGSEA.rtki.hipo016, rtna.consensusGSEA.rtkii.hipo016,
+	network.tfs,
+	res.rtn, res.crc,
+	file=paste(Sys.Date(), "_combined_GBM_RTN_GSEA_consensus_MR_heatmap_ResObj.Rdata", sep="")
+	)
+# output session info
+seshinf <- paste ( Sys.Date(), "_combined_GBM_RTN_GSEA_consensus_MR_heatmap_sessionInfo.txt", sep="" )
+writeLines( capture.output(sessionInfo()), seshinf )
+message("Finished!")

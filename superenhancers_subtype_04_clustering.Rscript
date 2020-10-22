@@ -1,0 +1,1291 @@
+#!/bin/R
+#
+# superenhancers_subtype_04_clustering.Rscript
+# 20170426 v1
+# 20180612 updated and massively improved, new R version v3.4.3, use Carl's target gene assignments, more plots, etc.
+#
+# Job request for resources: no need to parallelise bwaob (small SE universe)
+#	qsub -I -l walltime=2:00:00,mem=16g,nodes=1
+#
+# load EasyLoad modules beforehand:
+#	module load R-bundle/20171215-foss-2017a-R-3.4.3
+#	module load kentUtils # for bigWigAverageOverBed
+#
+# by Mike
+#
+##############################
+#
+# WHAT THIS DOES
+#
+# Continuing on from the previous SE calling (script 03):
+#
+# For all the GBM ChIPseq samples:
+#	1) read in ALL SEs (all subtypes) called, and create hockey stick plots for each subtype's SEs separately
+#	2) defines a GBM-wide "SE universe", then calculate signal over universe using external call to bigWigAverageOverBed, as per script 02; 
+#			also use target genes as defined by Carl (see below)
+#	3) generate an extremely fancy heatmap (see code below), clustering on the z-scores of log10(H3K27ac)
+#	4) and then generates a subset of the big fancy heatmap looking only at genes of interest
+#	5) generate boxplots showing GX of target genes for subtype-specific SEs
+#	6) also generate ChromHMM heatmap showing functional annotation at each subtype SE set
+#
+# TO-DO: still need to decide whether to include SE-target gene assignments from InTAD
+#
+# OUTPUTS
+#	1. hockey stick plots for each subtype's SE list, labelled with top 15 SE target genes that are also subtype genes (limma)
+#	2. lots of tables of SEs, with annotations, H3K27ac signal, etc.
+#	3. heatmaps showing the SE universe (and selected genes of interest as defined below)
+#	4. GX boxplots showing the expression of subtype SE target genes
+#	5. ChromHMM heatmap with the functional states at each subtype SE.
+# 
+##############################
+
+##############################
+#
+# FUNCTIONS
+#
+##############################
+################
+# FUNCTION TO ADD SOME HUMAN-READABLE GENE NAMES
+#
+# use function from the RNAseq BioC workflow tutorial...:
+convertIDs <- function( ids, from, to, db, ifMultiple=c("putNA", "useFirst")) {
+  stopifnot( inherits( db, "AnnotationDb" ) )
+  ifMultiple <- match.arg( ifMultiple )
+  suppressWarnings( selRes <- AnnotationDbi::select(
+    db, keys=ids, keytype=from, columns=c(from,to) ) )
+  if ( ifMultiple == "putNA" ) {
+    duplicatedIds <- selRes[ duplicated( selRes[,1] ), 1 ]
+    selRes <- selRes[ ! selRes[,1] %in% duplicatedIds, ]
+  }
+  return( selRes[ match( ids, selRes[,1] ), 2 ] )
+}
+################
+ 
+################
+# FUNCTION TO READ "_subtype_enhancers_SuperEnhancers.table.txt" FILES AS GRANGES
+#
+# these files are tab-delim with 3 #-lead comment lines, then a header
+#
+# options:
+# table = /path/to/input.table
+# keep.mcols = LOGICAL, keep extra columns as metadata in GR?
+load.se.table <- function( table, keep.mcols=TRUE ) 
+{
+  # read in
+  d <- read.table( file=table, header=T, comment.char="#", sep="\t" ) 
+  
+ if( keep.mcols==TRUE )
+  {
+  # set up as GR; keep mcols:
+  gr <- GRanges( 	seqnames=d$chrom,
+	  	 			ranges=IRanges( d$start, d$end ),
+					NUM_LOCI=d$NUM_LOCI,
+					CONSTITUENT_SIZE=d$CONSTITUENT_SIZE,
+					name=d$name,
+					enhancerRank=d$enhancerRank,
+                    mcols=data.frame( d[,-(1:8)] )
+				)
+   } else {
+  # set up as GR; drop mcols:
+  gr <- GRanges( 	seqnames=d$chrom,
+	  	 			ranges=IRanges( d$start, d$end ),
+					NUM_LOCI=d$NUM_LOCI,
+					CONSTITUENT_SIZE=d$CONSTITUENT_SIZE,
+					name=d$name,
+					enhancerRank=d$enhancerRank 
+				)  
+    }
+  
+  # return gr 
+  return( gr )
+}
+################
+
+##############################
+#
+# setup: load libs, definitions, etc.
+#
+##############################
+message("Loading libraries...")
+# load libs:
+suppressMessages(library(rtracklayer))
+suppressMessages(library(ggplot2))
+# heatmap colours
+suppressMessages( library(marray) )
+suppressMessages( library(RColorBrewer) )
+# load libraries for Zuguang's EnrichedHeatmap package
+suppressMessages( library(ComplexHeatmap) )
+suppressMessages( library(circlize) )
+suppressMessages( library(EnrichedHeatmap) )
+suppressMessages( library(GetoptLong) )
+# load TX annotation lib
+suppressMessages(library(org.Hs.eg.db))
+# for plots
+suppressMessages(library(ggplot2))
+# load Epik 
+suppressMessages( library(epik) )
+
+################
+# source zuguang's epik config file for the hipo016 project
+################
+# can also use library(epik) if that is up-to-date
+load_epik_config("/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/WGBS_final_cohort/script/hipo16_config_epik.R")
+
+# don't load text in tables as factors
+options(stringsAsFactors=F)
+
+# don't use dingbats in output pdfs
+pdf.options(useDingbats=FALSE)
+
+# ChromHMM colour definitions
+state_name = c("TssA", "TssFlnk", "TssFlnkU", "TssFlnkD", "Tx", "TxWk", "EnhG1", "EnhG2", "EnhA1", "EnhA2", "EnhWk", "ZNF/Rpts", "Het",
+    "TssBiv", "EnhBiv", "ReprPC", "ReprPCWk", "Quies")
+names(state_name) = paste0("E", ifelse(nchar(1:18) == 1, "0", ""), 1:18)
+state_col = c("#FF0000", "#FF4500", "#FF4500", "#FF4500", "#008000", "#006400",
+    "#C2E105", "#C2E105", "#FFC34D", "#FFC34D", "#FFFF00", "#66CDAA", "#8A91D0",
+    "#CD5C5C", "#BDB76B", "#808080", "#C0C0C0", "#FFFFFF")
+names(state_col) = names(state_name)
+
+# make new clustering, plots, tables, heatmaps subdirs
+system2("mkdir", "clustering")
+system2("mkdir", "plots")
+system2("mkdir", "tables")
+system2("mkdir", "heatmaps")
+
+# load common HIPO016 code
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+# load limma Renv
+# for subtype-specific gene lists
+load(limma.renv)
+
+# output/analysis dir: define + set
+output.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/chipseq_superenhancers"
+setwd(output.dir)
+message(paste("Output directory:", output.dir))
+
+message("Loading sample metadata...")
+# read in sample metadata:
+# use RDS object with many metadata:
+metadata <- readRDS(path.metadata.rds)
+# sort metadata by AK ID (it should be already but just in case)
+metadata <- metadata[ order(metadata$ak_id), ]
+
+# get list of sample IDs from chipseq dir
+# grep for AK*
+sample.ids <- list.files(path.chipseq)[ grep(x=list.files(path.chipseq), pattern="^AK") ] 
+
+# now: filter metadata obj only for these AK IDs:
+metadata <- metadata[ metadata$ak_id %in% sample.ids, ]
+
+# filter sample IDs only for those present in metadata
+sample.ids <- sample.ids[ sample.ids %in% metadata$ak_id ]
+
+# vectors of interesting gene symbols to label in the plot below:
+# genes of interest for GB
+genes.of.interest <- c("CREB3L2", "ELK3", "MAFF", "MAFB", "VDR", "TRIM28", "KLF6", "TEAD3", "NR2E1", # Jeannette's candidates
+	"SOX10", "NR0B1", "MYT1", "MYT1L", "RBPJ", "GPR17", "ERBB3", "HAND2", "SCN9A", "CDK4", "DLX5", "ONECUT2", # RTK_I genes
+	"CEBPB", "CEBPD", "FOSL1", "FOSL2", "RUNX1", "RUNX2", "RUNX3", "STAT3", "STAT5A", "VDR", "BHLHE40", "GATA3", "BATF", "MAFK", "ERG", "SPI1", "FOXC1", # MES genes
+	"BACH1", "BACH2", "TCF3", "JUND", "MEOX2", "POU2F2", "POU3F2", "HES1", "SOX9", "BOC", "CCND2", "ETV4", "ETV5", # RTK_II genes
+	"OLIG1", "OLIG2", "GLI1", "GLI2", "GLI3", "SOX2", "ASCL1", "NEUROD4", "NEUROG1", "NEUROD2", # normal brain related TFs
+	"EGFR", "PDGFRA", "PDGFA", "CDK4", "DLX5", "BRD4", "MYC", "MYCN", "SMAD9", "SOX3", "DACH1", "THRA" # other GBM genes or (IDH) MRs
+	 )
+
+##############################
+#
+# start code
+# first: get universe of SEs (all SEs across all subtypes)
+#
+##############################
+message("Loading per-subtype SE lists...")
+# load output from the ROSE2 pipeline: get the "SUBTYPE_subtype_enhancers_SuperEnhancers.table.txt" files
+#
+# this is all SEs in a subtype, including closest genes.
+#
+# use function to import this text file as a GRanges obj
+# drop mcols
+enh.idh <- load.se.table( table="./IDH_subtype_enhancers_SuperEnhancers.table.txt", keep.mcols=F )
+enh.mes <- load.se.table( table="./MES_subtype_enhancers_SuperEnhancers.table.txt", keep.mcols=F )
+enh.rtki <- load.se.table( table="./RTK_I_subtype_enhancers_SuperEnhancers.table.txt", keep.mcols=F )
+enh.rtkii <- load.se.table( table="./RTK_II_subtype_enhancers_SuperEnhancers.table.txt", keep.mcols=F )
+
+
+##############################
+# generate barplot of # subtype SEs
+##############################
+# first: plot df
+df.plot <- data.frame(subtype=names(subtype.colours), number=c(length(enh.idh),length(enh.mes),length(enh.rtki),length(enh.rtkii)))
+
+# plot obj:
+# map subtype to x axis, number of SEs to y
+p <- ggplot(data=df.plot, aes(x=subtype, y=number)) + 
+# use barplot, define subtype colours, don't add legend
+geom_bar(aes(fill=subtype), stat="identity", width=.5) + scale_fill_manual(values=subtype.colours, guide=F) +
+# various plot appearance things
+theme_bw() + xlab(NULL) + ylab(NULL) + 
+# define order of categorical x variables
+scale_x_discrete(limits=c("IDH","MES","RTK_I","RTK_II"))
+
+# output
+outputname <- paste0( "Subtype_SE_calls_barplot_", Sys.Date(), ".pdf" )
+pdf(outputname, height=3, width=4)
+p
+dev.off()
+
+##############################
+#
+# make some nice shiny hockey stick plots...
+#
+# for each subtype: load carl's anno SE list, colour points by subtype gene, label marker genes.
+#
+# target gene anno by carl in:
+# /icgc/dkfzlsdf/analysis/hipo/hipo_016/user_folder/herrmanc/analysis/2018-02-23_boxplot_SE/data
+# with datestamp 2018-04-04
+#
+##############################
+path.dir.anno.se <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/user_folder/herrmanc/analysis/2018-02-23_boxplot_SE/data"
+
+# loop over each subtype
+for( subtype in c("IDH", "MES", "RTK_I", "RTK_II"))
+{
+    message(subtype)
+
+# let's have a look at the subtype SE calls
+se.anno <- readRDS(paste0(path.dir.anno.se, "/2018-04-04_", subtype, "_SE_annotated.rds"))
+# ah, coerce to a GR...
+se.anno <- GRanges(
+    seqnames=se.anno$chr,
+    ranges=IRanges(start=se.anno$start, end=se.anno$end),
+    strand="*", # set strand to ambig
+    id=se.anno$id, # these are Carl's IDs, not mine
+    mcols=se.anno[,-(1:4)] # drop first 5 cols, already used above
+)
+
+# for the hockey stick plot i also need *all* enhancers, dammit. not just super ones
+# so load THAT list...
+enh <- load.se.table( table=paste0( subtype, "_subtype_enhancers_AllEnhancers.table.txt" ) )
+
+# fetch the limma res df for the subtype, also
+limma <- get(paste0( "limma.", gsub(pattern="_", replacement="", x=tolower(subtype)) ))
+
+#
+# based on overlapping the two sets:
+# map the annotated target gene(s) back to my original SE calls
+enh$targets.cor <- rep("no target gene", length(enh))
+enh$targets.cor[ to(findOverlaps( se.anno, enh )) ] <- se.anno$mcols.targets.cor
+enh$targets.hic <- rep("no target gene", length(enh))
+enh$targets.hic[ to(findOverlaps( se.anno, enh )) ] <- se.anno$mcols.target.hic
+# now: label the SEs with target genes in the subtype gene list:
+enh$subtype_gene <- enh$targets.cor %in% limma$hgnc_symbol[ limma$adj.P.Val < 0.001 ]
+# coerce to yes/no
+enh$subtype_gene[enh$subtype_gene==T] <- "yes"
+enh$subtype_gene[enh$subtype_gene!="yes"] <- "no"
+
+# ALSO HERE: fetch the subtype SE calls that were loaded initially
+subtype.se <- get(paste0("enh.", gsub(pattern="_",replacement="",x=tolower(subtype)) ))
+# then add in the annotated target genes back:
+# map the annotated target gene(s) back to my original SE calls
+subtype.se$targets.cor <- rep("no target gene", length(subtype.se))
+subtype.se$targets.cor[ to(findOverlaps( se.anno, subtype.se )) ] <- se.anno$mcols.targets.cor
+subtype.se$targets.hic <- rep("no target gene", length(subtype.se))
+subtype.se$targets.hic[ to(findOverlaps( se.anno, subtype.se )) ] <- se.anno$mcols.target.hic
+# now: label the SEs with target genes in the subtype gene list:
+subtype.se$subtype_gene <- subtype.se$targets.cor %in% limma$hgnc_symbol[ limma$adj.P.Val < 0.001 ]
+# coerce to yes/no
+subtype.se$subtype_gene[subtype.se$subtype_gene==T] <- "yes"
+subtype.se$subtype_gene[subtype.se$subtype_gene!="yes"] <- "no"
+
+# at this point: output the subtype SE calls, annotated with target genes
+outputname <- paste0("./tables/Subtype_SEs_", subtype, "_annotated.bed")
+write.table( x=as.data.frame(subtype.se), sep="\t", quote=F, row.names=F, file=outputname,
+	col.names=c("chrom", "start", "end", "width", "strand", colnames(mcols(subtype.se)) ) )
+
+# define subtype marker genes to label:
+# take the top 15 (nice # to fit in the plot) subtype genes that are up-regulated:
+limma <- limma[order(limma$logFC, decreasing=T), ] # reorder by logFC
+marker.genes <- limma$hgnc_symbol[ limma$adj.P.Val < 0.001 & limma$logFC > 0 ]
+marker.genes <- marker.genes[!is.na(marker.genes)] # remove NAs (= no hgnc symbol)
+
+    
+# label the GR rows with these
+enh$marker_gene <- enh$targets.cor %in% marker.genes
+
+# now generate plot:
+# extract plot data as df from this gr
+plot.df <- data.frame( 
+    signal=enh$mcols.sample_mean, # for y, need mean signal
+    rank=rev(enh$enhancerRank), # for x, use rank in reverse so that high signal is at right (=high x values)
+    subtype_gene=enh$subtype_gene,
+    label=enh$marker_gene, # populate now,
+    target_gene=enh$targets.cor,
+    se=as.character(enh$mcols.isSuper) # is the enhancer a SE or not? coerce to character
+)
+# then replace with text label based on mapping the gene name:
+plot.df$label[plot.df$label==T] <- as.character(plot.df$target_gene[plot.df$label==T])
+# coerce all others to NA
+plot.df$label[plot.df$label=="FALSE"] <- NA
+    
+# print the top 15 target genes' symbols labels as a text label - don't label points!
+#
+# take the top 15 marker genes that are target genes:
+marker.genes <- marker.genes[marker.genes %in% enh$targets.cor] # filter for markers that are targets
+marker.genes <- limma$hgnc_symbol[ match(marker.genes, limma$hgnc_symbol) ] # match against limma to order by logFC
+marker.genes <- marker.genes[ 1:min( 15, length(marker.genes) ) ] # take max of 15 gene names.
+# combine into single item
+labels <- paste0(marker.genes, collapse="\n")
+
+# define colours for points: 
+plot.cols <- c(subtype.colours[subtype], "black", use.names=F)
+# add names manually
+names(plot.cols) <- c("1", "0")
+
+# generate ggplot object
+p <- ggplot(data=plot.df, aes(x=rank, y=signal)) + # map rank to x-axis, signal to y-axis
+geom_point(aes(colour=se), size=0.75) + scale_colour_manual(values=plot.cols) + # point, colour whether it's an SE or now
+annotate("text", x=20000, y=max(plot.df$signal), label=labels, vjust=1, size=2.5 ) + # labels: gene names of SE targets that are also subtype-specific genes
+theme(strip.text = element_blank(), strip.background=element_blank() ) + # remove facet strip text/background
+theme_bw() + theme(legend.position="none") + # remove legend, change to black+white theme
+xlab("enhancer rank") + ylab("H3K27ac signal")
+# save copy of ggplot object to edit if needed for publication panels
+saveRDS(object=p, file=paste0( "./plots/", subtype, "_hockey_stick_ggplot_object_", Sys.Date(), ".rds" ))
+
+# output to pdf
+outputname <- paste0( "./plots/", subtype, "_hockey_stick_labelled_", Sys.Date(), ".pdf" )
+pdf(outputname, height=3, width=3)
+print(p) # print inside for loop
+dev.off()
+    
+# close loop over subtypes
+}
+
+##############################
+# generate SE universe across all subtypes
+##############################
+message("Generating GBM SE universe...")
+# now: get all the SEs, then reduce => get the "universe" of SEs across subtypes
+se.all <- c( enh.idh, enh.mes, enh.rtki, enh.rtkii )
+se.all <- reduce(se.all)
+# removes all metadata cols, ha
+
+##############################
+# add SE numeric ID
+##############################
+se.all$name <- paste( "SE_universe_", seq(from=1, to=length(se.all), by=1), sep="" )
+
+##############################
+#
+# now: need to calculate the signal for all the subtypes...
+# use bigWigAverageOverBed, as previously done in script 02.
+#
+# could do that separately but it may be easier to use system calls from within R.
+#
+##############################
+message("Calculating sample signal (bigWigAverageOverBed) for SE universe...")
+
+# create new dir for this:
+system2( "mkdir", "sample_signal_se_universe" )
+
+##############
+# need to export the SE universe GR as bed for input for bigWigAverageOverBed:
+##############
+# export as BED
+outputname <- "./tables/SE_universe_all_subtype_SEs.bed"
+export( object=se.all, con=outputname, format="BED" )
+
+##############
+# now: need to run bigWigAverageOverBed
+##############
+# usage: bigWigAverageOverBed in.bw in.bed out.tab
+#
+# so, first: define args as df
+#
+# example input bw path: /icgc/dkfzlsdf/analysis/hipo/hipo_016/chipseq_newAlignments/wgs_bowtie/AK139/H3K27ac/bw/AK139_H3K27ac_SES_subtract.bw
+# for in.bed: use SE universe
+# out.tab: define per sample ID
+bwaob.args <- data.frame(
+		path.bigwig = paste( path.chipseq, "/", sample.ids, "/H3K27ac/bw/", sample.ids, "_H3K27ac_SES_subtract.bw", sep="" ),
+		in.bed = paste( output.dir, outputname, sep="/" ),
+		out.tab = paste( output.dir, "/sample_signal_se_universe/", sample.ids, "_H3K27ac_in_SE_universe.tab", sep="" )
+	)
+
+# then run bigWigAverageOverBed using system2:
+# apply over the df
+apply( X=bwaob.args, MARGIN=1, FUN=function(row) system2("bigWigAverageOverBed", args=paste(row[1], row[2], row[3]) ) )
+
+message("... done!")
+##############
+# read back in the bigWigAverageOverBed output
+##############
+message("Loading sample signal...")
+# get paths from the args df
+path.signal.samples <- as.character(bwaob.args$out.tab)
+
+# each of these .tab files has following columns (as per bigWigAverageOverBed output):
+# 	name (of region), region size (bp), # covered bp in region, sum (of bigWig), mean0 (mean of bp cov, non-covered bases = 0), mean (mean of bp cov, covered bases only) 
+#
+# as the region size is the same for all samples: take 'sum' as the signal intensity
+# 		as this is most comparable to the read-counting-based method in ROSE2 (mean... averages over gaps in the SE)
+#
+# read in that column (#4) as the per-sample information into a dataframe:
+# use as rownames the region names from first file read in
+#
+# have variable #samples per subtype so also need to account for that...
+# first read in first sample: 
+signal.samples <- data.frame( read.delim(path.signal.samples[1], header=F)[,4], row.names=read.delim(path.signal.samples[1], header=F)[,1])
+
+# then read in all following samples...
+for( i in 2:length(path.signal.samples) )
+{
+	signal.samples <- cbind( signal.samples, read.delim(path.signal.samples[i], header=F)[,4] )
+}
+
+# add column names from sample ids
+colnames(signal.samples) <- sample.ids
+
+# replace rowname with the SE id
+rownames(signal.samples) <- se.all$id
+
+##############################
+# add target gene assignments from Carl, see above
+#
+# format as follows:
+# col 1 = chrom, 2 = bp start, 3 = bp end, 4 = gene symbol|distance to SE|correlation|pval|in the TAD?
+##############################
+# path to this table:
+path.se.universe.targets <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/user_folder/herrmanc/analysis/2018-02-23_boxplot_SE/data/consensus_se/SE_universe_all_subtype_SEs.targets.sp.500000.targetSelection.dist.txt"
+# read in:
+se.all.targets <- read.table(path.se.universe.targets, sep="\t", header=F)
+
+# coerce to a GR so can overlap with se.all:
+se.all.targets <- GRanges( 
+    seqnames=se.all.targets[,1], 
+    ranges=IRanges(start=se.all.targets[,2], end=se.all.targets[,3]),
+    target_gene=se.all.targets[,4] )
+
+# then add the target gene information back to se.all GR:
+# map based on findOverlaps:
+olap <- findOverlaps(se.all, se.all.targets)
+se.all$target_gene[ from(olap) ] <- as.character(se.all.targets$target_gene[ to(olap) ])
+
+# now split by the pipe into separate cols:
+targets <- sapply( X=se.all$target_gene, FUN=function(string) strsplit(as.character(string), split="[|]") )
+# remap each vector component back to the GR mcols:
+se.all$target_gene <- sapply(targets, "[", 1)
+se.all$distance_to_se <- sapply(targets, "[", 2)
+se.all$correlation <- sapply(targets, "[", 3)
+se.all$pval <- sapply(targets, "[", 4)
+se.all$in_TAD <- sapply(targets, "[", 5)
+
+# also convert to ENSG ID for later:
+se.all$target_gene_ensg <- convertIDs( ids=se.all$target_gene, from="SYMBOL", to="ENSEMBL", db=org.Hs.eg.db, ifMultiple="useFirst")
+
+# use write.table to write as text for IGV:
+# for column names convert to BED-"compatible" ones
+outputname <- "./tables/SE_universe_all_subtype_SEs_annotated.bed"
+write.table( x=as.data.frame(se.all), sep="\t", quote=F, row.names=F, file=outputname,
+	col.names=c("chrom", "start", "end", "width", "strand", colnames(mcols(se.all)) ) )
+
+##############################
+#
+# GX data
+#
+##############################
+message("Loading HIPO016 GX data...")
+########################
+#
+# RNAseq matrices from Zuguang
+#	final R object name: EXPR with log2(rpkm+1)
+#	with rows = genes (ENSG IDs), columns = sample AK IDs
+#
+########################
+# filter for samples present in H3K27ac signal matrix:
+expr <- EXPR[,colnames(EXPR) %in% colnames(signal.samples)]
+
+##############################
+#
+# limma subtype DEG results - for subtype logFC
+#
+##############################
+message("Collating limma subtype DEG results...")
+
+# build logFC matrix: take logFC column from each deg.subtype df
+# all in same order so just add
+target.gx.logfc <- data.frame(
+	IDH = limma.idh$logFC,
+	MES = limma.mes$logFC,
+	RTK_I = limma.rtki$logFC,
+	RTK_II = limma.rtkii$logFC,
+	symbol = limma.idh$hgnc_symbol
+	)
+
+# get rows corresponding to the SE genes:
+target.gx.logfc <- target.gx.logfc[ match( se.all$target_gene, target.gx.logfc$symbol ), ]
+
+# replace rownames with the SE ID and remove the symbol col:
+rownames(target.gx.logfc) <- se.all$id
+target.gx.logfc <- subset( target.gx.logfc, select=-c(symbol) )
+
+# n.b. some genes have no logFCs...!
+
+##############################
+#
+# now: generate output heatmap
+#
+##############################
+message("Generating output heatmaps...")
+
+############
+# plot data:
+############
+# for plotting: transform raw signal by taking log
+# first: set negative/zero values to 1
+signal.samples[ signal.samples <= 0 ] <- 1
+# take log2
+signal.plot <- log2(signal.samples)
+
+# order by subtype: IDH - MES - RTK_I - RTK_II
+signal.plot <- signal.plot[ , as.character(metadata$ak_id[ order( metadata$subtype_final ) ]) ]
+
+# also summarise across subtype:
+signal.plot.by.subtype <- data.frame(
+	IDH = rowMeans( signal.plot[ , colnames(signal.plot) %in% metadata$ak_id[metadata$subtype_final=="IDH"] ] ),
+	MES = rowMeans( signal.plot[ , colnames(signal.plot) %in% metadata$ak_id[metadata$subtype_final=="MES"] ] ),
+	RTK_I = rowMeans( signal.plot[ , colnames(signal.plot) %in% metadata$ak_id[metadata$subtype_final=="RTK_I"] ] ),
+	RTK_II = rowMeans( signal.plot[ , colnames(signal.plot) %in%  metadata$ak_id[metadata$subtype_final=="RTK_II"] ] ),
+	row.names = rownames(signal.plot)
+	)
+
+# generate z-score log10(H327ac signal) matrices for plotting
+#
+# generate the scaled matrices: scale() each row, then take the transposed matrix 
+# need to re-add column names
+signal.plot.z <- t(apply( signal.plot, 1, scale ))
+colnames(signal.plot.z) <- colnames(signal.plot)
+signal.plot.by.subtype.z <- t(apply( signal.plot.by.subtype, 1, scale ))
+colnames(signal.plot.by.subtype.z) <- colnames(signal.plot.by.subtype)
+
+############
+# colours for heatmaps
+############
+# need to define cols for z-score scale
+# use 3-color divergent purple-orange palette
+#
+# set breaks based on scaled H3K27ac matrix
+# range is -4 to 3.38 to go from -4 to 4 in  steps:
+#
+# use PuOr brewer palette but reversed (orange = high, purple = low)
+cols.z <- colorRamp2( breaks=c( -4, -2, 0, 2, 4 ), colors=rev(brewer.pal(5, "PuOr")) )
+
+# colours for logFC heatmap
+logfc.cols <- colorRamp2( breaks=c( min(target.gx.logfc, na.rm=T), 0, max(target.gx.logfc, na.rm=T) ),colors=c("darkgreen", "white", "darkred") )
+
+############
+# subtype annotations:
+############
+# generate heatmap annotations:
+#
+# for colours: see below. pass a list, for each column in predicted.subtypes a vector mapping subtype->colour:
+#
+# do for sample heatmap:
+ha <- ComplexHeatmap::HeatmapAnnotation( 
+    df=data.frame(subtype=metadata$subtype_final[match( colnames(signal.plot), metadata$ak_id)]), # reorder anno df according to column order above (!)
+    col=list( 
+		subtype=c( IDH="#e41a1c", MES="#377eb8", RTK_I="#4daf4a", RTK_II="#984ea3" )
+    ),
+    na_col="black", show_annotation_name=FALSE, annotation_name_side="left"   
+ )
+#
+# do for subtype heatmap:
+ha.2 <- ComplexHeatmap::HeatmapAnnotation( 
+    df=data.frame(subtype=c("IDH", "MES", "RTK_I", "RTK_II")),
+    col=list( 
+		subtype=c( IDH="#e41a1c", MES="#377eb8", RTK_I="#4daf4a", RTK_II="#984ea3" )
+    ),
+    na_col="black", show_annotation_name=FALSE, annotation_name_side="left"   
+ )
+ 
+############ 
+# label rows of interest
+############
+# find indices of genes in Heatmap input matrix
+# 
+# match a matrix row (=SE) to gene symbol, based on matching genes.of.interest to SE IDs - add leading "_" as get bad
+#
+# the plot matrix in same row order as SE GR
+goi.hits <- match( genes.of.interest, se.all$target_gene) 
+# returns a vector of indices, drop NAs
+goi.hits <- goi.hits[!is.na(goi.hits)]
+# now set up df for these indices/labels
+row.labels <- data.frame( row_index = unique( goi.hits ) ) 
+# add gene symbol based on subsetting:
+row.labels$label <- se.all$target_gene[goi.hits]
+
+############
+# plot + output
+############
+# generate Heatmap object
+# start with subtype avg heatmap, cluster on that - ward.D2, distance = 1-Pearson
+p <- Heatmap( as.matrix(signal.plot.by.subtype.z), col=cols.z, name="z-scores of\nlog2(H3K27ac)", width=unit(2, "cm"), column_names_gp = gpar(fontsize = 8),
+	clustering_method_rows="ward.D2", clustering_distance_rows=function(x) as.dist(1-cor(t(x))), row_dend_width = unit(2, "cm"), top_annotation=ha.2,
+	row_title=paste( length(se.all), " glioblastoma superenhancers" ),
+    column_title="Subtype", column_title_gp = gpar(fontsize = 9), show_row_names=F, cluster_columns=FALSE ) +	
+Heatmap( signal.plot.z, col=cols.z, name="z-scores of\nlog2(H3K27ac)", width=unit(6, "cm"), cluster_columns=F, cluster_rows=TRUE,
+	column_title="Sample", show_row_names=F, column_title_gp = gpar(fontsize = 9), column_names_gp = gpar(fontsize = 8), top_annotation=ha ) +
+# subtype logFC heatmap
+Heatmap( as.matrix(target.gx.logfc), col=logfc.cols, name="GX logFC", width=unit(2, "cm"), column_names_gp = gpar(fontsize = 8), top_annotation=ha.2,
+	column_title="Target gene\nlogFC", column_title_gp = gpar(fontsize = 9), show_row_names=F, cluster_columns=FALSE, na_col="white" ) +
+# label some of the rows of interest - MRs, etc. defined in vectors above	
+# see https://www.bioconductor.org/packages/release/bioc/vignettes/ComplexHeatmap/inst/doc/s4.heatmap_annotation.html#toc_14
+# use row_anno_link: args: at = indices of the rows you want to label in original matrix; label = vector of character labels (both defined above)
+# do for genes of interest first:
+rowAnnotation(link = row_anno_link(at = row.labels$row_index, labels = row.labels$label), width = unit(0.2, "cm") + max_text_width(row.labels), gp = gpar(fontsize = 5) )
+# and for CRC MRs, use italic fontface: 
+#rowAnnotation(link = row_anno_link(at = row.labels2$row_index, labels = row.labels2$label), width = unit(0.2, "cm") + max_text_width(row.labels2), gp = gpar(fontsize = 5) )
+  
+# output as PDF: 
+# generate outputname
+outputname <- "./heatmaps/SE_universe_cluster_samples.pdf"
+# open plotting device
+pdf(file=outputname, width=14, height=14)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- "./heatmaps/SE_universe_cluster_samples.png"
+# open plotting device
+png(file=outputname, width=14*ppi, height=14*ppi, res=ppi)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+
+############
+# also plot for "labelled" rows only (i.e. SEs assigned to genes of interest)
+#
+# subset input matrices based in row.indices defined above
+############
+# generate Heatmap object
+p <- Heatmap( as.matrix(signal.plot.by.subtype.z[row.labels$row_index,]), col=cols.z, name="z-scores of\nlog2(H3K27ac)", width=unit(2, "cm"), column_names_gp = gpar(fontsize = 8),
+	clustering_method_rows="ward.D2", clustering_distance_rows=function(x) as.dist(1-cor(t(x))), row_dend_width = unit(2, "cm"),
+	row_title=paste( nrow(row.labels), " selected superenhancers" ),
+    column_title="Subtype", column_title_gp = gpar(fontsize = 9), show_row_names=F, cluster_columns=FALSE ) +	
+Heatmap( signal.plot.z[row.labels$row_index,], col=cols.z, name="z-scores of\nlog2(H3K27ac)", width=unit(6, "cm"), cluster_columns=F, cluster_rows=TRUE,
+	column_title="Sample", show_row_names=F, column_title_gp = gpar(fontsize = 9), column_names_gp = gpar(fontsize = 8), top_annotation=ha ) +
+# subtype H3K27ac signal heatmap
+# subtype logFC heatmap
+Heatmap( as.matrix(target.gx.logfc[row.labels$row_index,]), col=logfc.cols, name="GX logFC", width=unit(2, "cm"), column_names_gp = gpar(fontsize = 8),
+	column_title="Target gene\nlogFC", column_title_gp = gpar(fontsize = 9), show_row_names=F, cluster_columns=FALSE, na_col="white" ) +
+# label all of our rows of interest - MRs, etc. defined in vector above	
+# see https://www.bioconductor.org/packages/release/bioc/vignettes/ComplexHeatmap/inst/doc/s4.heatmap_annotation.html#toc_14
+# use row_anno_text now:
+rowAnnotation(text = row_anno_text(row.labels$label), width = max_text_width(row.labels$label), gp = gpar(fontsize = 5) )
+#rowAnnotation(text = row_anno_text(row.labels2$label), width = max_text_width(row.labels2$label), gp = gpar(fontsize = 5, fontface=3) )
+# output as PDF: 
+# generate outputname
+outputname <- "./heatmaps/SE_universe_cluster_samples_GOI.pdf"
+# open plotting device
+pdf(file=outputname, width=14, height=14)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- "./heatmaps/SE_universe_cluster_samples_GOI.png"
+# open plotting device
+png(file=outputname, width=14*ppi, height=14*ppi, res=ppi)
+draw( p, heatmap_legend_side = "left", annotation_legend_side = "left" )
+dev.off()
+
+##############################
+#
+# try MDS on SE universe:
+#
+##############################
+# plot, use log2 signal as matrix
+# generate sample distance matrix: use transverse of signal.plot
+sampleDistMatrix <- as.matrix(dist(t(signal.plot)))
+# then do mds
+mds <- data.frame(cmdscale(sampleDistMatrix))
+# add column with subtype for point colour
+mds$Subtype <- metadata$subtype_final[match(colnames(signal.plot), metadata$ak_id)]
+# output:
+outputname <- paste( "./plots/", "SE_universe_MDS_on_H3K27ac_", Sys.Date(), ".pdf", sep="")
+pdf(outputname, width=5, height=4)
+# use black+white theme:
+print(qplot(X1, X2, color = Subtype, data = mds) + scale_colour_manual(values = subtype.colours) + theme_bw())
+dev.off()
+# also output as png
+outputname <- paste( "./plots/", "SE_universe_MDS_on_H3K27ac_", Sys.Date(), ".png", sep="")
+png(outputname, width=600, height=512)
+# use black+white theme:
+print(qplot(X1, X2, color = Subtype, data = mds) + scale_colour_manual(values = subtype.colours) + theme_bw())
+dev.off()
+
+##############################
+#
+# identify subtype SEs with anova; calculate log2FC also
+#
+##############################
+##############
+# for each row in the SE list: calculate ANOVA pvals and log2FC
+##############
+#
+# do for active: use H3K27ac signal as mark of "subtype specificity"
+# cos these are active enhancers, and so we'll use the active mark 
+#
+# set negative values to 1, then
+# transform sum of signal to log2 before testing
+#
+##############
+# open output data frame
+active.anova <- data.frame( name=se.all$name, 
+                           anova.pvalue=vector("numeric", length(se.all)),
+						   mean_IDH_log2_H3K27ac=vector("numeric", length(se.all)),
+						   mean_MES_log2_H3K27ac=vector("numeric", length(se.all)),
+						   mean_RTK_I_log2_H3K27ac=vector("numeric", length(se.all)),
+						   mean_RTK_II_log2_H3K27ac=vector("numeric", length(se.all)),
+                           log2FC_IDH=vector("numeric", length(se.all)),
+                           log2FC_MES=vector("numeric", length(se.all)),
+                           log2FC_RTK_I=vector("numeric", length(se.all)),
+                           log2FC_RTK_II=vector("numeric", length(se.all)) 
+                          )
+# do for every row in GR:
+for( r in 1:length(se.all) )
+{
+    message(r)
+    t <- signal.plot[r,] # extract row of interest
+    # build dataframe for doing aov: signal = numeric values log2-transformed, group = subtypes
+    data <- data.frame( signal=t(as.matrix( t[, match(as.character(metadata$ak_id), colnames(t) )] )), 
+                       group=factor(metadata$subtype_final) )
+    colnames(data)[1] <- "signal" # fix idiot colname coercion
+    #data$signal[ data$signal <= 0 ] <- 1 # set minimum value of signal to 1
+    #data$signal <- log2(data$signal) # log2 transform signal
+    fit <- aov( signal ~ group, data ) # fit model
+    active.anova[r,"anova.pvalue"] <- unlist(anova(fit)[5])[1] # get unadjusted anova pvalue
+	# calculate signal average for each subtype in turn:
+	active.anova[r,"mean_IDH_log2_H3K27ac"] <- mean( data$signal[ data$group=="IDH" ] )
+	active.anova[r,"mean_MES_log2_H3K27ac"] <- mean( data$signal[ data$group=="MES" ] )
+	active.anova[r,"mean_RTK_I_log2_H3K27ac"] <- mean( data$signal[ data$group=="RTK_I" ] )
+	active.anova[r,"mean_RTK_II_log2_H3K27ac"] <- mean( data$signal[ data$group=="RTK_II" ] )
+    # calculate log2FC for each subtype in turn   
+    # these are log2 values so just subtract:
+    active.anova[r,"log2FC_IDH"] <- mean( data$signal[ data$group=="IDH" ] ) - mean( data$signal[ data$group!="IDH" ] )
+    active.anova[r,"log2FC_MES"] <- mean( data$signal[ data$group=="MES" ] ) - mean( data$signal[ data$group!="MES" ] )
+    active.anova[r,"log2FC_RTK_I"] <- mean( data$signal[ data$group=="RTK_I" ] ) - mean( data$signal[ data$group!="RTK_I" ] )
+    active.anova[r,"log2FC_RTK_II"] <- mean( data$signal[ data$group=="RTK_II" ] ) - mean( data$signal[ data$group!="RTK_II" ] )
+}
+
+# correct pvals (use BH/fdr = same thing in R p.adjust)
+active.anova$adj.anova.pvalue <- p.adjust(active.anova$anova.pvalue, method="BH")
+
+# check that the peak IDs match:
+table( active.anova$name == se.all$name )
+# should all be TRUE; then:
+
+# then add this whole df to the GR metadata columns, dropping the peak_id (1st) column,
+mcols(se.all) <- data.frame( mcols(se.all), active.anova[,-1] )
+# and also add in the per-signal info, fix colnames:
+colnames(signal.plot) <- paste0( colnames(signal.plot), "_log2_H3K27ac" )
+mcols(se.all) <- data.frame( mcols(se.all), signal.plot )
+
+# write again as bed:
+# use write.table to write as text for IGV:
+# for column names convert to BED-"compatible" ones
+outputname <- "./tables/SE_universe_all_subtype_SEs_annotated.bed"
+write.table( x=as.data.frame(se.all), sep="\t", quote=F, row.names=F, file=outputname,
+	col.names=c("chrom", "start", "end", "width", "strand", colnames(mcols(se.all)) ) )
+
+################################################
+#
+# generate lists of subtype SEs
+#
+################################################
+#
+# for input for genomic regions: homer needs bed files
+# http://homer.ucsd.edu/homer/ngs/peakMotifs.html
+#
+#
+#BED files should have at minimum 6 columns (separated by TABs, additional columns will be ignored)
+#
+#    Column1: chromosome
+#    Column2: starting position
+#    Column3: ending position
+#    Column4: Unique Peak ID
+#    Column5: not used
+#    Column6: Strand (+/- or 0/1, where 0="+", 1="-")
+#
+#
+# so write this data from the enh.union.active GRange
+#
+# for column 5 = use the subtype avg, log2 of H3K27ac signal (may be used later to filter peaks during motif finding)
+#
+# function to do so, args (defaults are those auto-produced by this analysis):
+#
+# gr.enh = GR of the active enhancer union (i.e. for all enh)
+# subtype = character: name of subtype, used in output filename
+# pval.col = column name or index (within metadata columns) for the (adjusted) pvals; default = "adj.pvalue"
+# pval.thr = (adjusted) pval threshold to use; default = defined above in setup
+# subtype.mean.col = column name or index for the subtype mean, log2, sum of H3K27ac signal
+# log2FC.col = column name or index for the log2FC calculated for the subtype of interest
+# log2FC.thr = log2FC threshold to use; default = defined above in setup
+write.subtype.enh.lists <- function( gr.enh, subtype, pval.col="adj.anova.pvalue", pval.thr=enh.pval.thr, subtype.mean.col, log2FC.col, log2FC.thr=enh.log2FC.thr )
+{
+    # extract rows from GR matching the thresholds:
+    gr <- gr.enh[ mcols(gr.enh)[ , pval.col ] < pval.thr & mcols(gr.enh)[ , log2FC.col ] > log2FC.thr ]
+    
+    # generate output as data frame:
+    out <- data.frame(chromosome = seqnames(gr), start=start(gr), end=end(gr), region_id=gr$name,
+                     mean_log2_H3K27ac=mcols(gr)[ , subtype.mean.col ], strand=rep("+", length(gr)) # define strand as + for all - enhancers are unstranded
+                     )
+    
+    # write to output file:
+    outputname <- paste0("./tables/SE_universe_", subtype, "-specific_SEs_FDR_", pval.thr, "_log2FC_", log2FC.thr, ".bed")
+    write.table( x=out, file=outputname, quote=F, sep="\t", row.names=F, col.names=F )
+}
+
+# define pval/FC thresholds, as per active enhancer analysis:
+enh.pval.thr <- 0.1
+enh.log2FC.thr <- 1
+
+# do for IDH:
+write.subtype.enh.lists( se.all, "IDH", subtype.mean.col="mean_IDH_log2_H3K27ac", log2FC.col="log2FC_IDH" )
+
+# do for MES:
+write.subtype.enh.lists( se.all, "MES", subtype.mean.col="mean_MES_log2_H3K27ac", log2FC.col="log2FC_MES" )
+
+# do for RTK_I:
+write.subtype.enh.lists( se.all, "RTK_I", subtype.mean.col="mean_RTK_I_log2_H3K27ac", log2FC.col="log2FC_RTK_I" )
+
+# do for RTK_II:
+write.subtype.enh.lists( se.all, "RTK_II", subtype.mean.col="mean_RTK_II_log2_H3K27ac", log2FC.col="log2FC_RTK_II" )
+
+################################################
+#
+# plot the GX of genes per subtype, for each subtype SE list
+#
+################################################
+#
+# use Carl's predicted target genes.
+#
+#####################################
+#
+# plot subtype vs other GBM subtypes (collated), 1 vs 3: use logFC
+#
+#####################################
+# now for each list of enhancers: want to look up:
+# 1. the annotated gene;
+# 2. GX of this annotated gene, per subtype
+#
+# and build a ggplot2-style data frame:
+# ensg_id, type (type of GX: from the subtype, or the other cancers), logFC from limma analysis
+
+# define ylim for the logFC 
+logfc.ylims <- c(-3, 4.5)
+
+########
+# for IDH:
+########
+subtype <- "IDH"
+# get #subtype-specific enh:
+n.enh <- length(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_IDH > enh.log2FC.thr ])
+# get ensg IDs of genes mapping near sig. enh:take unique IDs only, may have multiple identical IDs.
+ids <- unique(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_IDH > enh.log2FC.thr ])
+# repeat this 2 times for each "type" of gx
+logfc.plot.idh <- data.frame( ensg_id = rep( x=ids, times=2)  )
+# add type:
+# rep by #ids, cycling over subtype of interest / other GBMs, as factor with subtype first:
+logfc.plot.idh$type <- factor( c(rep(subtype, length(ids)), rep("other GBMs", length(ids))), levels=c(subtype, "other GBMs") )
+# add GX for subtype of interest, then other cancers, then normal:
+# get rows by matching ensg id, get columns by matching on subtype
+# then calculate mean per row
+#
+# look up in log2-transformed expr:
+logfc.plot.idh$logfc <- c(
+	# look up logFC for subtype, matching ENSG IDs with trailing .XX:
+	limma.idh$logFC[ match(ids, limma.idh$ensembl_gene) ],
+    # then calculate avg logFC for other 3 subtypes:
+	apply( X=matrix( c(limma.mes$logFC[ match(ids, limma.mes$ensembl_gene) ],
+		limma.rtki$logFC[ match(ids, limma.rtki$ensembl_gene) ],
+		limma.rtkii$logFC[ match(ids, limma.rtkii$ensembl_gene) ]), ncol=3 ), 
+		MARGIN=1, FUN=mean)
+    )
+# statistical testing:
+# 2-tail t-test
+res.ttest <- t.test(x=logfc.plot.idh$logfc[logfc.plot.idh$type==subtype], y=logfc.plot.idh$logfc[logfc.plot.idh$type!=subtype])
+# capture output to text
+capture.output( res.ttest, file=paste0("./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_t-test_output.txt") )
+# get p.value to 4 sig figs
+t.pval.idh <- signif( res.ttest$p.value, 4)
+
+# plot
+outputname <- paste0( "./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_logFC.png" )
+title <- paste0("Expression (logFC) of target genes\n (n=",length(ids),") for ", subtype, 
+                "-specific SEs (n=", n.enh, ")\n2-tail t-test p: ", t.pval.idh)
+png(outputname, height=800, width=400, bg="transparent")
+ggplot( data=logfc.plot.idh, aes(x=type, y=logfc, fill=type) ) + geom_boxplot(notch=F) + ggtitle(title) +
+ylab("logFC") + xlab(NULL) + theme(axis.text.x = element_text(angle=45, vjust=0.5) ) +
+stat_summary(fun.y="mean", geom="point", shape=23, size=3, fill="white") + scale_fill_manual(values=c(subtype.colours[subtype], "other GBMs"="white")) +
+# change theme to blacknwhite, use manually defined ylims
+theme_bw() + ylim(logfc.ylims) +
+# increase y-axis tick label size, remove panel grid lines, 
+theme(axis.text.y = element_text(size=rel(1.5)), panel.border=element_blank(), 
+      panel.grid.major=element_blank(), panel.grid.minor=element_blank() ) 
+dev.off()
+
+########
+# for MES:
+########
+subtype <- "MES"
+# get #subtype-specific enh:
+n.enh <- length(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_MES > enh.log2FC.thr ])
+# get ensg IDs of genes mapping near sig. enh:take unique IDs only, may have multiple identical IDs.
+ids <- unique(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_MES > enh.log2FC.thr ])
+# repeat this 2 times for each "type" of gx
+logfc.plot.mes <- data.frame( ensg_id = rep( x=ids, times=2)  )
+# add type:
+# rep by #ids, cycling over subtype of interest / other GBMs
+logfc.plot.mes$type <- factor( c(rep(subtype, length(ids)), rep("other GBMs", length(ids))), levels=c(subtype, "other GBMs") )
+# add GX for subtype of interest, then other cancers, then normal:
+# get rows by matching ensg id, get columns by matching on subtype
+# then calculate mean per row
+#
+# look up in log2-transformed expr:
+logfc.plot.mes$logfc <- c(
+	# look up logFC for subtype, matching ENSG IDs with trailing .XX:
+	limma.mes$logFC[ match(ids, limma.mes$ensembl_gene) ],
+    # then calculate avg logFC for other 3 subtypes:
+	apply( X=matrix( c(limma.idh$logFC[ match(ids, limma.idh$ensembl_gene) ],
+		limma.rtki$logFC[ match(ids, limma.rtki$ensembl_gene) ],
+		limma.rtkii$logFC[ match(ids, limma.rtkii$ensembl_gene) ]), ncol=3 ), 
+		MARGIN=1, FUN=mean)
+    )
+# statistical testing:
+# 2-tail t-test
+res.ttest <- t.test(x=logfc.plot.mes$logfc[logfc.plot.mes$type==subtype], y=logfc.plot.mes$logfc[logfc.plot.mes$type!=subtype])
+# capture output to text
+capture.output( res.ttest, file=paste0("./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_t-test_output.txt") )
+# get p.value to 4 sig figs
+t.pval.mes <- signif( res.ttest$p.value, 4)
+
+# plot
+outputname <- paste0( "./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_logFC.png" )
+title <- paste0("Expression (logFC) of target genes\n (n=",length(ids),") for ", subtype, 
+                "-specific SEs (n=", n.enh, ")\n2-tail t-test p: ", t.pval.mes)
+png(outputname, height=800, width=400, bg="transparent")
+ggplot( data=logfc.plot.mes, aes(x=type, y=logfc, fill=type) ) + geom_boxplot(notch=F) + ggtitle(title) +
+ylab("logFC") + xlab(NULL) + theme(axis.text.x = element_text(angle=45, vjust=0.5) ) +
+stat_summary(fun.y="mean", geom="point", shape=23, size=3, fill="white") + scale_fill_manual(values=c(subtype.colours[subtype], "other GBMs"="white")) +
+# change theme to blacknwhite, use manually defined ylims
+theme_bw() + ylim(logfc.ylims) +
+# increase y-axis tick label size, remove panel grid lines, 
+theme(axis.text.y = element_text(size=rel(1.5)), panel.border=element_blank(), 
+      panel.grid.major=element_blank(), panel.grid.minor=element_blank() ) 
+dev.off()
+
+########
+# for RTK_I:
+########
+subtype <- "RTK_I"
+# get #subtype-specific enh:
+n.enh <- length(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_RTK_I > enh.log2FC.thr ])
+# get ensg IDs of genes mapping near sig. enh:take unique IDs only, may have multiple identical IDs.
+ids <- unique(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_RTK_I > enh.log2FC.thr ])
+# repeat this 2 times for each "type" of gx
+logfc.plot.rtki <- data.frame( ensg_id = rep( x=ids, times=2)  )
+# add type:
+# rep by #ids, cycling over subtype of interest / other GBMs
+logfc.plot.rtki$type <- factor( c(rep(subtype, length(ids)), rep("other GBMs", length(ids))), levels=c(subtype, "other GBMs") )
+# add GX for subtype of interest, then other cancers, then normal:
+# get rows by matching ensg id, get columns by matching on subtype
+# then calculate mean per row
+#
+# look up in log2-transformed expr:
+logfc.plot.rtki$logfc <- c(
+	# look up logFC for subtype, matching ENSG IDs with trailing .XX:
+	limma.rtki$logFC[ match(ids, limma.rtki$ensembl_gene) ],
+    # then calculate avg logFC for other 3 subtypes:
+	apply( X=matrix( c(limma.idh$logFC[ match(ids, limma.idh$ensembl_gene) ],
+		limma.mes$logFC[ match(ids, limma.mes$ensembl_gene) ],
+		limma.rtkii$logFC[ match(ids, limma.rtkii$ensembl_gene) ]), ncol=3 ), 
+		MARGIN=1, FUN=mean)
+    )
+
+# statistical testing:
+# 2-tail t-test
+res.ttest <- t.test(x=logfc.plot.rtki$logfc[logfc.plot.rtki$type==subtype], y=logfc.plot.rtki$logfc[logfc.plot.rtki$type!=subtype])
+# capture output to text
+capture.output( res.ttest, file=paste0("./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_t-test_output.txt") )
+# get p.value to 4 sig figs
+t.pval.rtki <- signif( res.ttest$p.value, 4)
+
+# plot
+outputname <- paste0( "./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_logFC.png" )
+title <- paste0("Expression (logFC) of target genes\n (n=",length(ids),") for ", subtype, 
+                "-specific SEs (n=", n.enh, ")\n2-tail t-test p: ", t.pval.rtki)
+png(outputname, height=800, width=400, bg="transparent")
+ggplot( data=logfc.plot.rtki, aes(x=type, y=logfc, fill=type) ) + geom_boxplot(notch=F) + ggtitle(title) +
+ylab("logFC") + xlab(NULL) + theme(axis.text.x = element_text(angle=45, vjust=0.5) ) +
+stat_summary(fun.y="mean", geom="point", shape=23, size=3, fill="white") + scale_fill_manual(values=c(subtype.colours[subtype], "other GBMs"="white")) +
+# change theme to blacknwhite, use manually defined ylims
+theme_bw() + ylim(logfc.ylims) +
+# increase y-axis tick label size, remove panel grid lines, 
+theme(axis.text.y = element_text(size=rel(1.5)), panel.border=element_blank(), 
+      panel.grid.major=element_blank(), panel.grid.minor=element_blank() ) 
+dev.off()
+
+########
+# for RTK_II:
+########
+subtype <- "RTK_II"
+# get #subtype-specific enh:
+n.enh <- length(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_RTK_II > enh.log2FC.thr ])
+# get ensg IDs of genes mapping near sig. enh:take unique IDs only, may have multiple identical IDs.
+ids <- unique(se.all$target_gene_ensg[ se.all$adj.anova.pvalue < enh.pval.thr & se.all$log2FC_RTK_II > enh.log2FC.thr ])
+# repeat this 2 times for each "type" of gx
+logfc.plot.rtkii <- data.frame( ensg_id = rep( x=ids, times=2)  )
+# add type:
+# rep by #ids, cycling over subtype of interest / other GBMs
+logfc.plot.rtkii$type <- factor( c(rep(subtype, length(ids)), rep("other GBMs", length(ids))), levels=c(subtype, "other GBMs") )
+# add GX for subtype of interest, then other cancers, then normal:
+# get rows by matching ensg id, get columns by matching on subtype
+# then calculate mean per row
+#
+# look up in log2-transformed expr:
+logfc.plot.rtkii$logfc <- c(
+	# look up logFC for subtype, matching ENSG IDs with trailing .XX:
+	limma.rtkii$logFC[ match(ids, limma.rtkii$ensembl_gene) ],
+    # then calculate avg logFC for other 3 subtypes:
+	apply( X=matrix( c(limma.idh$logFC[ match(ids, limma.idh$ensembl_gene) ],
+		limma.mes$logFC[ match(ids, limma.mes$ensembl_gene) ],
+		limma.rtki$logFC[ match(ids, limma.rtki$ensembl_gene) ]), ncol=3 ), 
+		MARGIN=1, FUN=mean)
+    )
+# statistical testing:
+# 2-tail t-test
+res.ttest <- t.test(x=logfc.plot.rtkii$logfc[logfc.plot.rtkii$type==subtype], y=logfc.plot.rtkii$logfc[logfc.plot.rtkii$type!=subtype])
+# capture output to text
+capture.output( res.ttest, file=paste0("./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_t-test_output.txt") )
+# get p.value to 4 sig figs
+t.pval.rtkii <- signif( res.ttest$p.value, 4)
+
+# plot
+outputname <- paste0( "./plots/SE_universe_", subtype, "-specific_SE_target_GX_", Sys.Date(), "_logFC.png" )
+title <- paste0("Expression (logFC) of target genes\n (n=",length(ids),") for ", subtype, 
+                "-specific SEs (n=", n.enh, ")\n2-tail t-test p: ", t.pval.idh)
+png(outputname, height=800, width=400, bg="transparent")
+ggplot( data=logfc.plot.rtkii, aes(x=type, y=logfc, fill=type) ) + geom_boxplot(notch=F) + ggtitle(title) +
+ylab("logFC") + xlab(NULL) + theme(axis.text.x = element_text(angle=45, vjust=0.5) ) +
+stat_summary(fun.y="mean", geom="point", shape=23, size=3, fill="white") + scale_fill_manual(values=c(subtype.colours[subtype], "other GBMs"="white")) +
+# change theme to blacknwhite, use manually defined ylims
+theme_bw() + ylim(logfc.ylims) +
+# increase y-axis tick label size, remove panel grid lines, 
+theme(axis.text.y = element_text(size=rel(1.5)), panel.border=element_blank(), 
+      panel.grid.major=element_blank(), panel.grid.minor=element_blank() ) 
+dev.off()
+
+########
+# generate single plot with all 4 subtypes/other GBMs:
+#
+# for the figure...
+########
+# generate plot df:
+# combine the per-subtype plot dfs, add an extra column corresponding to the facet wanted:
+logfc.plot.all <- data.frame(
+	type=c( as.character(logfc.plot.idh$type), as.character(logfc.plot.mes$type), as.character(logfc.plot.rtki$type), as.character(logfc.plot.rtkii$type) ),
+	logfc=c( logfc.plot.idh$logfc, logfc.plot.mes$logfc, logfc.plot.rtki$logfc, logfc.plot.rtkii$logfc ),
+	facet=c( rep("1", nrow(logfc.plot.idh)), rep("2", nrow(logfc.plot.mes)), rep("3", nrow(logfc.plot.rtki)), rep("4", nrow(logfc.plot.rtkii)) )
+	)
+# refactor type so can use in plotting, ordered by subtype alphabetically
+logfc.plot.all$type <- factor(logfc.plot.all$type, levels=c("IDH","MES","RTK_I","RTK_II","other GBMs"))
+
+# add 2-tail t-test pvals to these boxplots as text: need annotation df
+# build with: facet names (to match logfc.plot.all), pval as labels, x/y coords
+logfc.plot.text <- data.frame(
+	facet=c("1","2","3","4"),
+	label=as.character( c(t.pval.idh, t.pval.mes, t.pval.rtki, t.pval.rtkii) )
+	)
+
+# generate plot obj
+# aesthetics: for x-axis split by subtype, y-axis use logfc values, fill with subtype colour; use boxplot; facet grid, free x-axis scales
+p <- ggplot( data=logfc.plot.all, aes(x=type, y=logfc, fill=type) ) + geom_boxplot(notch=F) + facet_grid( . ~ facet, scales="free_x", space="free_x" ) +
+ylab("logFC") + xlab(NULL) + theme(axis.text.x = element_text(angle=45, vjust=0.5) ) +
+stat_summary(fun.y="mean", geom="point", shape=23, size=3, fill="white") + scale_fill_manual(values=c(subtype.colours, "other GBMs"="white")) +
+theme_bw() + ylim(logfc.ylims) + # change theme to blacknwhite, use manually defined ylims
+# increase y-axis label and tick label font size, remove panel border,
+theme(axis.title.y = element_text(size=rel(2)), axis.text.y = element_text(size=rel(2)), panel.border=element_blank() ) +
+# remove facet strip text/background, remove x-axis tick mark labels and the x-axis tick marks:
+theme(strip.text = element_blank(), strip.background=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank() ) +
+guides(fill=FALSE) + # remove legend
+annotate("segment", x=1, xend=2, y=4.2, yend=4.2) + # add horizontal lines above boxes
+annotate("text", x=1.5, y=4.3, label="***", size=5)  # add ***s centred between boxplots in each facet, just above line
+
+# output as pdf:
+outputname <- paste0( "./plots/SE_universe_allSubtypes-specific_SE_target_GX_", Sys.Date(), "_logFC.pdf" )
+pdf(outputname, height=3, width=8, bg="transparent")
+print(p)
+dev.off()
+# output as png:
+outputname <- paste0( "./plots/SE_universe_allSubtypes-specific_SE_target_GX_", Sys.Date(), "_logFC.png" )
+png(outputname, height=300, width=800, bg="transparent")
+print(p)
+dev.off()
+
+#############################################
+#
+# produce ChromHMM heatmaps for the subtype SEs
+#
+#############################################
+###############
+# now: use epik to load the ChromHMM states for each subtype
+###############
+# see ipynb 20180207 also
+#
+# get chromhmm states for contrasting subtype
+# set merge=T to get consensus
+states.idh <- get_chromHMM_list( metadata$ak_id[metadata$subtype_final=="IDH"], merge=T)
+states.mes <- get_chromHMM_list( metadata$ak_id[metadata$subtype_final=="MES"], merge=T)
+states.rtki <- get_chromHMM_list( metadata$ak_id[metadata$subtype_final=="RTK_I"], merge=T)
+states.rtkii <- get_chromHMM_list( metadata$ak_id[metadata$subtype_final=="RTK_II"], merge=T)
+
+# rename all states in loaded states GRs to remove the leading E
+states.idh$states <- as.numeric(gsub( pattern="E", replacement="", x=states.idh$states ))
+states.mes$states <- as.numeric(gsub( pattern="E", replacement="", x=states.mes$states ))
+states.rtki$states <- as.numeric(gsub( pattern="E", replacement="", x=states.rtki$states ))
+states.rtkii$states <- as.numeric(gsub( pattern="E", replacement="", x=states.rtkii$states ))
+
+###############
+# next: load the subtype SEs
+###############
+# use the most recently defined set of subtype-specific ones, at least:
+# define colnames
+colnames <- c("chrom", "start", "end", "name", "signal", "strand")
+# define subtypes
+subtypes <- c("IDH", "MES", "RTK_I", "RTK_II")
+# define vector of input bed paths: in working dir
+path.input.se <- paste0( "./tables/SE_universe_", subtypes, "-specific_SEs_FDR_0.1_log2FC_1.bed")
+# load each subtype-specific SE set: do as list
+se.subtypes <- lapply(path.input.se, read.bed, colnames=colnames)
+#
+# combine into single GR with split = subtype
+# need to strip metadata cols first
+mcols(se.subtypes[1][[1]]) <- NULL
+mcols(se.subtypes[2][[1]]) <- NULL
+mcols(se.subtypes[3][[1]]) <- NULL
+mcols(se.subtypes[4][[1]]) <- NULL
+# recombine, split for heatmap = subtype
+se.states <- c(se.subtypes[1][[1]], se.subtypes[2][[1]], se.subtypes[3][[1]], se.subtypes[4][[1]])
+se.states$subtype <- c( rep("IDH SEs", times=length(se.subtypes[1][[1]])), rep("MES SEs", times=length(se.subtypes[2][[1]])),
+                rep("RTK_I SEs", times=length(se.subtypes[3][[1]])), rep("RTK_II SEs", times=length(se.subtypes[4][[1]])) )
+
+
+#
+# otherwise the normalizeToMatrix() function will get averages of the state values, heh
+# 
+# Basically, you need to:
+# 1. reduce the number of states, e.g. merge 1-4 as active tss states, 16-17 as repressive states
+# 2. assign a value for each simplified states, e.g. 1 for active states 2 for tx states, ...
+# 3. make the normalized matrix 
+# 4. visualize the matrix as heatmap with define color for each state
+#
+# so let's do that: first, reduce state number in new mcol
+#
+# based on state_name: map 1-4 to Tss, 5-6 to Tx, 7-11 to Enh, 12-13 to Het/Rpts, 14-15 to Biv, 16-17 to ReprPC, 18 to Quiescent
+reduce_ChromHMM_18states <- function( states )
+{
+    # take input states vector, and then map as above
+    # TSS to 1
+    states[ states==1 | states==2 | states==3 | states==4 ] <- 1
+    # Tx to 2
+    states[ states==5 | states==6 ] <- 2
+    # Enh to 3
+    states[ states==7 | states==8 | states==9 | states==10 | states==11 ] <- 3
+    # Het/Rpts to 4
+    states[ states==12 | states==13 ] <- 4
+    # Biv to 5
+    states[ states==14 | states==15 ] <- 5
+    # ReprPc to 6
+    states[ states==16 | states==17 ] <- 6
+    # Quiescent to 7
+    states[ states==18 ] <- 7
+    # return mapped states vector
+    return(states)
+}
+# now add in as new col
+states.idh$states_reduced  <- reduce_ChromHMM_18states(states.idh$states)
+states.mes$states_reduced  <- reduce_ChromHMM_18states(states.mes$states)
+states.rtki$states_reduced  <- reduce_ChromHMM_18states(states.rtki$states)
+states.rtkii$states_reduced  <- reduce_ChromHMM_18states(states.rtkii$states)
+
+# re normalize matrices:
+# Zuguang's example works because he does not set a target region with a width
+# so normalizeToMatrix() won't average out values
+# so let's define the enhancer set as the centre of the SE, then normalize to that
+#
+# find centre of enhancer peaks: make copy of GR and then replace values in IRanges
+se.states.centres <- se.states
+start(se.states.centres) <- mid(ranges(se.states))
+end(se.states.centres) <- start(se.states.centres)
+
+###############
+# extend by 10kbp around the SE midpoint
+# as mean width of an SE in this subtype-specific set is 43901.34:
+mean(width(se.states))
+#
+# use 200bp windows, for chromhmm works in those
+# set value_column=states_reduced, as defined above.
+#
+# do for each subtype in turn:
+mat.se.idh  <- normalizeToMatrix( states.idh, se.states.centres, extend=10000, w=200, value_column="states_reduced" )
+mat.se.mes  <- normalizeToMatrix( states.mes, se.states.centres, extend=10000, w=200, value_column="states_reduced" )
+mat.se.rtki  <- normalizeToMatrix( states.rtki, se.states.centres, extend=10000, w=200, value_column="states_reduced" )
+mat.se.rtkii  <- normalizeToMatrix( states.rtkii, se.states.centres, extend=10000, w=200, value_column="states_reduced" )
+
+# heatmap cols: as per zuguang above
+cols <- colorRamp2(1:7, state_col[c(1,5,7,12,14,16,18)])
+
+# heatmaps
+# no top_anno as it makes no sense here, hah
+ht.list <- EnrichedHeatmap(mat.se.idh, col = cols, name = "ChromHMM states", width = 1,
+		      top_annotation = NULL, top_annotation_height = NULL, row_title_rot = 90, axis_name_gp = gpar(fontsize = 4),
+              column_title = "IDH", column_title_gp = gpar(fontsize = 6), row_title_gp = gpar( fontsize = 6 ),
+              border=TRUE, pos_line=FALSE, axis_name=c("-10kbp", "mid", "+10kbp"),
+              split=se.states$subtype, show_heatmap_legend=FALSE ) +
+            EnrichedHeatmap(mat.se.mes, col = cols, name = "ChromHMM states", width = 1,
+		      top_annotation = NULL, top_annotation_height = NULL, row_title_rot = 90, axis_name_gp = gpar(fontsize = 4),
+              border=TRUE, pos_line=FALSE, axis_name=c("-10kbp", "mid", "+10kbp"),
+              column_title = "MES", column_title_gp = gpar(fontsize = 6), show_heatmap_legend=FALSE ) +
+            EnrichedHeatmap(mat.se.rtki, col = cols, name = "ChromHMM states", width = 1,
+		      top_annotation = NULL, top_annotation_height = NULL, row_title_rot = 90, axis_name_gp = gpar(fontsize = 4),
+              border=TRUE, pos_line=FALSE, axis_name=c("-10kbp", "mid", "+10kbp"),
+              column_title = "RTK_I", column_title_gp = gpar(fontsize = 6), show_heatmap_legend=FALSE ) +
+            EnrichedHeatmap(mat.se.rtkii, col = cols, name = "ChromHMM states", width = 1,
+		      top_annotation = NULL, top_annotation_height = NULL, row_title_rot = 90, axis_name_gp = gpar(fontsize = 4),
+              border=TRUE, pos_line=FALSE, axis_name=c("-10kbp", "mid", "+10kbp"),
+              column_title = "RTK_II", column_title_gp = gpar(fontsize = 6), show_heatmap_legend=FALSE )        
+
+# single legend for the heatmaps
+lgd <- Legend(
+    at = c("TSS", "Tx", "Enh", "Het/Rpts", "Biv", "ReprPC", "Qui"), type = "grid",
+    grid_height = unit(2, "mm"), grid_width = unit(2, "mm"), gap = unit(1, "mm"),
+    title = "ChromHMM states", title_gp = gpar(fontsize = 6, fontface = "bold"), labels_gp = gpar(fontsize = 5),
+    legend_gp = gpar(fill = state_col[c(1,5,7,12,14,16,18)]) # pass fill for a 'grid' legend
+) 
+            
+# output as PDF: 
+# generate outputname
+outputname <- paste0("./heatmaps/ChromHMM_at_H016_subtype-specific_SEs_allStatesReduced_", Sys.Date(), ".pdf")
+# open plotting device
+pdf(file=outputname, width=6, height=6)
+# draw legend also
+draw(ht.list, gap=unit(1,"cm"), annotation_legend_list = list(lgd), annotation_legend_side="left" )
+dev.off()
+
+##############################
+# save session info (just in case):
+##############################
+message("Saving session info...")
+# output session info
+seshinf <- paste ( Sys.Date(), "_superenhancers_04_cluster_sessionInfo.txt", sep="" )
+writeLines( capture.output(sessionInfo()), seshinf )		
+message("Finished analysis!")

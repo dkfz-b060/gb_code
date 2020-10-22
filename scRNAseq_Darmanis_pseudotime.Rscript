@@ -1,0 +1,1869 @@
+#!/bin/R-3.5.1
+#
+# scRNAseq_Darmanis_pseudotime.Rscript
+#
+# 20190329 - big update: improve subtyping of cells, add netB to regulon analysis
+# 20190225 v1 - first version of script
+#
+# pseudotime analysis of the Darmanis (2017) GB scRNAseq data set
+# manuscript: https://www.cell.com/cell-reports/pdf/S2211-1247(17)31462-6.pdf
+# raw data accession: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE84465
+# 
+# WHAT THIS DOES: takes the Darmanis raw read matrix, 
+# loads into monocle, process/normalise;sen do pseudotime analysis on all cells (tumour+normal)
+#
+# then plot subtype and Master Regulator expression on the pseudotime trajectory,
+# to show the association between subtype and MR activity
+#
+#########################################################
+#
+# cluster settings
+#
+#########################################################
+#
+# request interactive job, plenty of mem/cpu 
+#       qsub -I -l walltime=24:00:00,mem=256g,nodes=1:ppn=32
+# load R v3.5.1: module load R-bundle/20180906-foss-2017a-R-3.5.1
+#
+#########################################################
+#
+# SETUP: funs, libs, working directory, etc
+#
+#########################################################
+# load common HIPO016 code
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+# define n.cores to parallelise over
+n.cores <- 32
+
+# for output images: do NOT use dingbats font
+# set in base R devices option; all outputs are pdf so cool:
+pdf.options(useDingbats=FALSE)
+# set again
+options(useDingbats=FALSE)
+
+# define State colour vector
+state.colours <- c(subtype.colours["RTK_I"], "khaki4", subtype.colours["RTK_II"], "orange", subtype.colours["MES"])
+names(state.colours) <- 1:5
+
+#####
+# load libs
+#####
+suppressMessages( library("AnnotationDbi") )
+suppressMessages( library("org.Hs.eg.db") )
+suppressMessages( library(GSVA) )
+suppressMessages( library(ggplot2) )
+suppressMessages( library(ggbeeswarm) )
+suppressMessages( library(ComplexHeatmap) )
+suppressMessages( library(RColorBrewer) )
+suppressMessages( library(viridisLite) )
+suppressMessages( library(monocle) )
+suppressMessages( library(dplyr) )
+# RTN analysis packages:
+suppressMessages(library(RTN))
+suppressMessages(library(circlize))
+# VIPER
+suppressMessages(library(viper))
+# annotation libraries for VIPER analysis (mapping microarray probe IDs)
+suppressMessages(library(hgu133a.db))
+suppressMessages(library(hgu133plus2.db))
+# for beeswarm plots
+suppressMessages(library(ggbeeswarm))
+
+#####
+# set working dir
+#####
+setwd("/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/scRNAseq_Darmanis_2017/")
+
+#####
+# load various data:
+#####
+# 1. the raw read matrix:
+# space-delim text with a header line and random double quotes around some fields...
+mat.gx <- read.table(file="./GBM_data_and_metadata/GBM_raw_gene_counts.csv", header=T, quote="\"", sep=" ")
+# check how many rows/cols:
+dim(mat.gx) # should be 23368 genes x 3589 cells.
+colnames(mat.gx) <- gsub(pattern="^X", replacement="", x=colnames(mat.gx))  # fix colnames by removing leading X, to match metadata rownames
+#
+# 1a. cell metadata: 
+# as per the raw read matrix
+metadata <- read.table(file="./GBM_data_and_metadata/GBM_metadata.csv", header=T, quote="\"", sep=" ")
+# check rows/cols
+dim(metadata) # should give 3589 rows x 29 cols
+#
+# check: what cell identities are in this table?
+table(metadata$Cluster_2d)
+#
+#   1    2    3    4    5    6    7    8    9   10   11   12
+# 271   85   20  125   21   11  518 1329  406   88  695   20
+# re-map Darmanis IDs to meaningful labels:
+metadata$Cluster_2d[metadata$Cluster_2d==1] <- "Neoplastic_1"
+metadata$Cluster_2d[metadata$Cluster_2d==2] <- "Oligodendrocytes"
+metadata$Cluster_2d[metadata$Cluster_2d==3] <- "Vascular_1"
+metadata$Cluster_2d[metadata$Cluster_2d==4] <- "Neoplastic_2"
+metadata$Cluster_2d[metadata$Cluster_2d==5] <- "Neurons_1"
+metadata$Cluster_2d[metadata$Cluster_2d==6] <- "Neurons_2"
+metadata$Cluster_2d[metadata$Cluster_2d==7] <- "Myeloid_1"
+metadata$Cluster_2d[metadata$Cluster_2d==8] <- "Myeloid_2"
+metadata$Cluster_2d[metadata$Cluster_2d==9] <- "OPCs"
+metadata$Cluster_2d[metadata$Cluster_2d==10] <-"Astrocytes" 
+metadata$Cluster_2d[metadata$Cluster_2d==11] <- "Neoplastic_3"
+metadata$Cluster_2d[metadata$Cluster_2d==12] <- "Vascular_3"
+
+#####
+# start analysis: build monocle CellDataSet obj, normalise raw reads
+#####
+# generate input objects for the new CellDataSet:
+#
+# first: counts (expr) matrix - use full matrix to normalise, but filter for annotated genes below.
+#
+# phenoData - sample annotations - use full metadata set
+pd <- new("AnnotatedDataFrame", data=metadata)
+# featureData - expr matrix annotation - 
+# needs a column with name gene_short_name, and rownames matching the expr matrix rownames.
+# generate from Gencode ref:
+load(path.gencode) # load
+gencode <- gencode[gencode$type=="gene"] # filter for gene rows only
+# extract rows from metadata cols:
+fd <- mcols(gencode)[ match( rownames(mat.gx), gencode$gene_name), ]
+# replace colnames: gene_name with gene_short_name (to match feature names)
+colnames(fd)[colnames(fd)=="gene_name"] <- "gene_short_name"
+
+# now filter mat.gx and fd for the gene IDs (symbols) in both:
+d <- mat.gx[ rownames(mat.gx) %in% intersect( rownames(mat.gx), fd$gene_short_name), ]
+fd <- fd[ fd$gene_short_name %in% intersect( rownames(mat.gx), fd$gene_short_name), ]
+# check dims
+dim(d)
+dim(fd)
+
+# add in to rownames of df also
+rownames(fd) <- fd$gene_short_name
+fd <- new("AnnotatedDataFrame", data=as.data.frame(fd))
+#
+# generate new CellDataSet:
+# pass count matrix, matching pheno/feature dfs, and use appropriate expressionFamily for counts data (see vignette)
+dCellData <- newCellDataSet( as.matrix(d), 
+                            phenoData = pd, 
+                            featureData = fd, 
+                            expressionFamily = negbinomial.size())
+
+# calculate size factors for cells, and dispersions for genes:
+dCellData <- estimateSizeFactors(dCellData)
+dCellData <- estimateDispersions(dCellData)
+# removes 129 outliers...
+
+#####
+# define + characterise cell clusters for monocle analysis - look at all cells
+#####
+# do feature selection:
+# based on 'dpFeature' process: https://cole-trapnell-lab.github.io/monocle-release/docs/#alternative-choices-for-ordering-genes
+#
+# firstly, select genes expressed in >5% of cells:
+dCellData <- detectGenes(dCellData, min_expr = 0.1)
+
+# find most variable genes based on dispersion:
+disp_table <- dispersionTable(dCellData)
+unsup_clustering_genes <- subset(disp_table, mean_expression >= 0.1)
+dCellData <- setOrderingFilter(dCellData, unsup_clustering_genes$gene_id)
+# plot:
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_01_gene_dispersion_plot.pdf" )
+pdf(outputname)
+plot_ordering_genes(dCellData)
+dev.off()
+
+# plot % variance explained by each PC component:
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_02_PC_variance_explained.pdf" )
+pdf(outputname)
+plot_pc_variance_explained(dCellData, return_all = F)
+dev.off()
+# looks like up to top 4 are the most informative!
+
+# try top 4:
+dCellData <- reduceDimension(dCellData,
+                              max_components = 4,
+                              norm_method = 'log',
+                              num_dim = 3,
+                              reduction_method = 'tSNE',
+                              verbose = F)
+
+# based on this dimension reduction: find cell clusters
+#
+# based on rho/delta plot: try delta 20, rho 40; then viz
+# (defaults give 17 clusters which feels like too many!)
+dCellData <- clusterCells(dCellData,
+                 rho_threshold = 40,
+                 delta_threshold = 20,
+                 skip_rho_sigma = T,
+                 verbose = F)
+#
+# plot rho/delta:
+# here, rho = "cell's local density" ie how many and how close nearby cells are
+# and delta = "nearest distance"
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_03_rho_delta_plot.pdf" )
+pdf(outputname)
+plot_rho_delta(dCellData, rho_threshold = 40, delta_threshold = 20 )
+dev.off()
+
+# visualise to check clustering: do for multiple experimental factors
+# open output pdf
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_04_cell_clusters_byFactor.pdf" )
+pdf(outputname)
+# plot inferred cluster
+plot_cell_clusters(dCellData, color_by = 'as.factor(Cluster)', cell_size=0.75)
+# plot by selection method from the Darmanis paper:
+plot_cell_clusters(dCellData, color_by = 'as.factor(Selection)', cell_size=0.75)
+# sample name
+plot_cell_clusters(dCellData, color_by = "Sample.name", cell_size=0.75)
+# plot by Cluster(cell type) from the Darmanis paper:
+plot_cell_clusters(dCellData, color_by = 'as.factor(Cluster_2d)', cell_size=0.75)
+# plot by total reads
+plot_cell_clusters(dCellData, color_by = "Total_reads", cell_size=0.75)
+# plot by genes detected
+plot_cell_clusters(dCellData, color_by = "Genes_detected", cell_size=0.75)
+# plot by unique reads
+plot_cell_clusters(dCellData, color_by = "Unique_reads", cell_size=0.75)
+# ERCC ratio
+plot_cell_clusters(dCellData, color_by = "ERCC_to_non_ERCC", cell_size=0.75)
+dev.off()
+#
+# so based on these plots: clustering appears affected by Genes_detected + Sample.name.
+# 
+# clear clusters that are *single* samples: this needs to be removed...
+#
+# therefore: try regressing that out out and re-clustering:
+dCellData <- reduceDimension(dCellData,
+                              max_components = 4,
+                              norm_method = 'log',
+                              num_dim = 3,
+                              residualModelFormulaStr = "~Genes_detected + Sample.name",
+                              reduction_method = 'tSNE',
+                              verbose = F)
+
+# based on this dimension reduction: find cell clusters again
+dCellData <- clusterCells(dCellData,
+                 rho_threshold = 40,
+                 delta_threshold = 20,
+                 skip_rho_sigma = T,
+                 verbose = F)
+# visualise to check clustering:
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_05_cell_clusters_post-correction_byFactor.pdf" )
+pdf(outputname)
+plot_cell_clusters(dCellData, color_by = 'as.factor(Cluster)', cell_size=0.75)
+# plot by selection method from the Darmanis paper:
+plot_cell_clusters(dCellData, color_by = 'as.factor(Selection)', cell_size=0.75)
+# sample name
+plot_cell_clusters(dCellData, color_by = "Sample.name", cell_size=0.75)
+# plot by Cluster(cell type) from the Darmanis paper:
+plot_cell_clusters(dCellData, color_by = 'as.factor(Cluster_2d)', cell_size=0.75)
+# plot by total reads
+plot_cell_clusters(dCellData, color_by = "Total_reads", cell_size=0.75)
+# plot by genes detected
+plot_cell_clusters(dCellData, color_by = "Genes_detected", cell_size=0.75)
+# plot by unique reads
+plot_cell_clusters(dCellData, color_by = "Unique_reads", cell_size=0.75)
+# ERCC ratio
+plot_cell_clusters(dCellData, color_by = "ERCC_to_non_ERCC", cell_size=0.75)
+dev.off()
+#
+# and now: this is much better i think!
+#
+# WHY:
+#    1. firstly, the Darmanis cell clusters (Cluster_2d) are now much cleaner! 
+#          Cell types cluster together; and related cell types go together see OPCs + oligos
+#    2. the strong Sample name effect on clustering is also gone
+#
+# so the cluster definitions may still be a bit weird - e.g. the Darmanis "astrocytes" are lumped in with many
+# other cells that Darmanis says are not astrocytes; same with OLs/OPCs, which are likely RTK I tumour cells 
+# - but let's go ahead with the pseudotime
+
+###############
+# run pseudotime
+###############
+# so continue: find DEG to run pseudotime
+# test only genes expr in at least 10% of cells; parallelise over n.cores defined above
+thr.cells <- ncol(dCellData) * 0.1
+clustering_DEG_genes <- differentialGeneTest(
+  dCellData[ row.names(subset(fData(dCellData),num_cells_expressed >= thr.cells)), ], cores = n.cores,
+          fullModelFormulaStr = '~Cluster' )
+# get top 1000 DEG by significance for ordering
+ordering.genes <- row.names(clustering_DEG_genes)[order(clustering_DEG_genes$qval)][1:1000]
+# and what are the top 50?
+ordering.genes[1:50]
+
+# so continue: run pseudotime analysis
+#
+# select genes to use
+dCellData <- setOrderingFilter(dCellData, ordering_genes = ordering.genes)
+
+# run dimension analysis
+# regress out the Genes_detected and sample name (as these seem to confound the analysis!)
+# use #cores as defined above
+timestamp()
+dCellData <- reduceDimension(dCellData, pseudo_expr = 1, 
+                             residualModelFormulaStr = "~Genes_detected + Sample.name", num_threads=n.cores)
+timestamp() # 45s (!)
+#
+# order cells, reverse order
+dCellData <- orderCells(dCellData, reverse = TRUE)
+
+# plot:
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_06_pseudotime.pdf" )
+pdf(outputname, height=6, width=6)
+plot_cell_trajectory(dCellData, cell_size=0.75)
+dev.off()
+# and now we get *5* states, with 2 branch poinst.
+#
+# plot a bunch of other potensh factors:
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_07_pseudotime_byFactor.pdf" )
+pdf(outputname, height=6, width=6)
+# selection:
+plot_cell_trajectory(dCellData, color_by = "Selection", cell_size=0.75)
+# hmm: hard to see patterns here. some selections may be biased? but it's pretty heterogeneous
+#
+# Sample name:
+plot_cell_trajectory(dCellData, color_by = "Sample.name", cell_size=0.75)
+# hoo boy. yeah clear sample issues here... BT_S1 is the "start"; at least the other 3 samples are more mingled
+#
+# Total reads:
+plot_cell_trajectory(dCellData, color_by = "Total_reads", cell_size=0.75)
+# well that's not... too bad
+#
+# detected genes:
+plot_cell_trajectory(dCellData, color_by = "num_genes_expressed", cell_size=0.75)
+# yeah some bias here but not awful
+#
+# Darmanis clusters
+plot_cell_trajectory(dCellData, color_by = "as.factor(Cluster_2d)", cell_size=0.75)
+#
+# our Monocle clusters
+plot_cell_trajectory(dCellData, color_by = "Cluster", cell_size=0.75)
+# pseudotime
+plot_cell_trajectory(dCellData, color_by = "Pseudotime", cell_size=0.75)
+dev.off()
+
+#
+# plotting some markers, for subtypes and GB?
+# extract VST expr matrix from the dCellData object
+mat.gx.filt.2 <- vstExprs(dCellData)
+
+#####
+# plot: beeswarm/dotplot
+#
+# output per-gene pdfs for ease of use for selected genes
+#####
+genes.to.plot <- c("PDGFRA","ERBB3","PLP1","SOX10","ASCL1","OLIG1", "GPR17", # oligo/RTK_I genes
+                   "SOX2","SOX9","NES", # NSCs
+                   "DCN","TM4SF1","IFITM1", # endothelia
+                   "CNR1","STMN2", # neurons
+                   "OLR1","CD74","TGFBI","AIF1", "PTPRC", # microglia/macrophages
+                   "AGT","AQP4","EGFR","GFAP" # RTK_II/astrocytes
+                  )
+for( g in genes.to.plot ) 
+{
+    message(g)
+    # add to phenodata to plot
+    pData(dCellData)$GOI <- mat.gx.filt.2[g,]
+
+    # generate outputname 
+    outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_08_pseudotime_markerGenes_bees_",g,".pdf" )
+    pdf(outputname, height=2, width=6)
+
+    # print inside a for() loop
+    # pass phenodata for monocle obj as input dataframe
+    # split by pseudotime State on x
+    # plot GOI expression on y
+    # colour violins by State
+    # use quasirandom geom from ggbeeswarm
+    # title = gene name, b/w theme, change x/y axis labs
+    # remove legend
+    print( ggplot(data=pData(dCellData), aes(x=State, y=GOI, colour=State)) + 
+           geom_quasirandom(size=0.5) +
+           ggtitle(g) + theme_bw() + xlab(NULL) + ylab("expression (VST)") +
+           theme(legend.position="none")
+         )
+    dev.off()
+}
+# 
+# 
+#
+##########################################################################################
+##########################################################################################
+#
+# NEW NEW NEW 20190328
+#
+# now for each cell: subtype based on our GX signatures from limma analysis
+# use the UP-REGULATED genes in each subtype (as that's what other people do right, ha)
+#
+# NEW TODAY: follow as described in "Scoring cells for gene signatures" 
+#   https://www.cell.com/cell/fulltext/S0092-8674(19)30094-7
+#
+# briefly: accounts for cell-to-cell variability by 
+#   computing an expression-matched background set (across all cells)
+#   that is then used as an intracellular control/baseline to normalise the expression
+#   of genes of interest.
+#
+# additionally: load the "glioma stromal cell" gene list from Wang 2017:
+#      defined as the genes NOT in their "Glioma intrinsic genes" table in Supplementary Table S1
+#      (which is a list of gene symbols btw)
+#
+##########################################################################################
+##########################################################################################
+# load the limma Renv
+load(limma.renv)
+# each subtype list is loaded here: 
+# need to extract the gene symbols (to match rownames of the expression matrices),
+# for statistically significant (adjpval < 0.001) UP genes
+options(stringsAsFactors=F)
+df.subtype.genes <- rbind(
+  data.frame(symbol=limma.mes$hgnc_symbol[limma.mes$logFC>0 & limma.mes$adj.P.Val<0.001], subtype="MES"),
+  data.frame(symbol=limma.rtki$hgnc_symbol[limma.rtki$logFC>0 & limma.rtki$adj.P.Val<0.001], subtype="RTK_I"),
+  data.frame(symbol=limma.rtkii$hgnc_symbol[limma.rtkii$logFC>0 & limma.rtkii$adj.P.Val<0.001], subtype="RTK_II")
+)
+# remove NAs (subtype DEG with no symbol)
+df.subtype.genes <- df.subtype.genes[ !is.na(df.subtype.genes$symbol), ]
+# how many left?
+dim(df.subtype.genes)
+# should give 2173 genes; how many per subtype?
+table(df.subtype.genes$subtype)
+#  MES  RTK_I RTK_II
+#  1035    370    768
+# so roughly in proportions expected
+
+# use extracted VST expr matrix from the dCellData object
+mat.gx.filt <- vstExprs(dCellData)
+
+# calculate up the average expression (across all cells) for each subtype gene
+mat.gx.means <- rowMeans( mat.gx.filt )
+df.subtype.genes$expr.avg <- mat.gx.means[ match(df.subtype.genes$symbol, names(mat.gx.means)) ]
+# remove any genes with no values
+df.subtype.genes <- df.subtype.genes[ !is.na(df.subtype.genes$expr.avg), ]
+# what do we have left?
+dim(df.subtype.genes) # 2030 genes
+table(df.subtype.genes$subtype)
+#   MES  RTK_I RTK_II
+#   935    290    693
+
+# before parallelising: clean up env
+gc()
+
+# for each cell/gene: find background geneset, of 100 genes with smallest difference in expr
+# calculate the average of this background geneset; 
+#
+# define function: take a cell's gx profile and then, for each resistance gene, find the background set + calculate its average expression
+calc.bg.expr <- function( gx.profile,gene )
+{
+   # calculate differences:
+   diffs <- gx.profile[ !(names(gx.profile) %in% gene) ] - gx.profile[ (names(gx.profile) %in% gene) ]
+   # order **absolute** differences by increasing size; take first 100 genes (w/ smallest diffs) as the bg
+   diffs <- diffs[order( abs(diffs), decreasing=F )]
+   genes.bg <- names(diffs[1:100]) 
+   # calculate average of this bg set, and return it
+   genes.bg.expr <- mean( gx.profile[ names(gx.profile) %in% genes.bg ]) 
+   return(genes.bg.expr)
+}
+# calculate over all cell IDs (will take some time...! parallelise with mclapply)
+# predicted to take ~4h w/ 4 cores; therefore: with 32: half an hour...?
+timestamp() # 
+subtype.genes.expr.bg <- mclapply( X=colnames(mat.gx.filt), FUN=function(col) {
+    message(col)
+    sapply(X=df.subtype.genes$symbol, FUN=calc.bg.expr, gx.profile=mat.gx.filt[,col])
+}, mc.cores=n.cores )
+timestamp() # does take about half an hour or so...
+
+# some fail?
+# so rerun them: find indices of empty results
+failed <- which(unlist(lapply(1:length(subtype.genes.expr.bg), function(x) length(subtype.genes.expr.bg[x][[1]]))) == 0)
+
+# use a while loop: are there are failed entries,
+while( length(failed) > 0 )
+{
+    # rerun:
+    rerun.failed <- mclapply( X=failed, FUN=function(index) {
+        message(index)
+        sapply(X=df.subtype.genes$symbol, FUN=calc.bg.expr, gx.profile=mat.gx.filt[,index])
+    }, mc.cores=n.cores )
+
+    # check if there are any empty results still
+    table(unlist(lapply(1:length(rerun.failed), function(x) length(rerun.failed[x][[1]]))) == 0)
+    
+    # based on indices can add back in to the original output list:
+    for( i in failed )
+        {
+            subtype.genes.expr.bg[i] <- rerun.failed[which(failed==i)]
+        }
+
+    # update the 'failed' vector: check again if there's still any entries with no result vector
+    failed <- which(unlist(lapply(1:length(subtype.genes.expr.bg), function(x) length(subtype.genes.expr.bg[x][[1]]))) == 0)    
+    message(paste0("Remaining failed cells: ", length(failed)))
+}
+
+# check again, if there are any empty results still
+table(unlist(lapply(1:length(subtype.genes.expr.bg), function(x) length(subtype.genes.expr.bg[x][[1]]))) == 0)
+# all F; great
+
+# as this returns a list: now need to coerce to a matrix
+subtype.genes.expr.bg <- do.call(cbind, subtype.genes.expr.bg)
+# add in colnames:
+colnames(subtype.genes.expr.bg) <- colnames(mat.gx.filt)
+
+# now for each subtype signature, can calculate the activation score, as described above:
+# for each signature gene subtract this calculated background expression 
+#
+# extract the per-cell expression values for the resistance genes:
+mat.gx.subtype.genes <- mat.gx.filt[ match( df.subtype.genes$symbol, rownames(mat.gx.filt)), match(colnames(subtype.genes.expr.bg),colnames(mat.gx.filt)) ]
+
+# are the two matrices the same dimensions?
+dim(subtype.genes.expr.bg) == dim(mat.gx.subtype.genes)
+# both TRUE
+#
+# yes: then can just subtract the background from the foreground:
+mat.gx.subtype.genes <- mat.gx.subtype.genes - subtype.genes.expr.bg
+
+# then calculate average of the signature gene expression as the score;
+subtype.scores.mes <- colMeans( mat.gx.subtype.genes[ match( df.subtype.genes$symbol[df.subtype.genes$subtype=="MES"], rownames(mat.gx.subtype.genes)), ], na.rm=T )
+subtype.scores.rtki <- colMeans( mat.gx.subtype.genes[ match( df.subtype.genes$symbol[df.subtype.genes$subtype=="RTK_I"], rownames(mat.gx.subtype.genes)), ], na.rm=T )
+subtype.scores.rtkii <- colMeans( mat.gx.subtype.genes[ match( df.subtype.genes$symbol[df.subtype.genes$subtype=="RTK_II"], rownames(mat.gx.subtype.genes)), ], na.rm=T )
+
+# calculate thresholds to binarise cells based on expression or not of the signature:
+# as above: median + 1.5x MAD
+subtype.scores.mes.threshold <- median(subtype.scores.mes) + 1.5*mad(subtype.scores.mes)
+subtype.scores.rtki.threshold <- median(subtype.scores.rtki) + 1.5*mad(subtype.scores.rtki)
+subtype.scores.rtkii.threshold <- median(subtype.scores.rtkii) + 1.5*mad(subtype.scores.rtkii)
+
+# and what do the scores look like, distribution-wise...?
+summary(subtype.scores.mes)
+summary(subtype.scores.rtki)
+summary(subtype.scores.rtkii)
+# so quite different...
+#
+# what are the distributions like?
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_09_subtype_signature_score_dist.pdf" )
+pdf(outputname)
+qplot(subtype.scores.mes, binwidth=0.1) + geom_vline(xintercept=subtype.scores.mes.threshold)
+qplot(subtype.scores.rtki, binwidth=0.1) + geom_vline(xintercept=subtype.scores.rtki.threshold)
+qplot(subtype.scores.rtkii, binwidth=0.1) + geom_vline(xintercept=subtype.scores.rtkii.threshold)
+dev.off()
+
+# finally, add to the monocle object's pheno data and visualise:
+#
+# binarise: any cell > threshold is resistant, and vice versa.
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_09a_subtype_signature_score_pseudotime.pdf" )
+pdf(outputname)
+# mes:
+# add scores:
+phenoData(dCellData)$subtype.scores.mes <- subtype.scores.mes[ match(rownames(phenoData(dCellData)), names(subtype.scores.mes)) ]
+# define cell states based on threshold:
+phenoData(dCellData)$subtype.scores.mes.binary <- phenoData(dCellData)$subtype.scores.mes > subtype.scores.mes.threshold
+plot_cell_trajectory(dCellData, color_by = "as.factor(subtype.scores.mes.binary)") 
+
+# rtki:
+# add scores:
+phenoData(dCellData)$subtype.scores.rtki <- subtype.scores.rtki[ match(rownames(phenoData(dCellData)), names(subtype.scores.rtki)) ]
+# define cell states based on threshold:
+phenoData(dCellData)$subtype.scores.rtki.binary <- phenoData(dCellData)$subtype.scores.rtki > subtype.scores.rtki.threshold
+plot_cell_trajectory(dCellData, color_by = "as.factor(subtype.scores.rtki.binary)") 
+
+# rtkii:
+# add scores:
+phenoData(dCellData)$subtype.scores.rtkii <- subtype.scores.rtkii[ match(rownames(phenoData(dCellData)), names(subtype.scores.rtkii)) ]
+# define cell states based on threshold:
+phenoData(dCellData)$subtype.scores.rtkii.binary <- phenoData(dCellData)$subtype.scores.rtkii > subtype.scores.rtkii.threshold
+plot_cell_trajectory(dCellData, color_by = "as.factor(subtype.scores.rtkii.binary)") 
+
+# close plotting device
+dev.off()
+#
+# that is... NOT convincing.
+#
+# plot #TRUE cells per pseudotime state? generate df for ggplot2 with subtypes/states combinations
+df.plot <- data.frame(
+  subtype=rep(c("mes","rtki","rtkii"), times=5),
+  state=rep(x=levels(phenoData(dCellData)$State), each=3),
+  n=0 ) 
+# populate:
+for(s in unique(df.plot$subtype))
+{
+    # generate the phenoData colname from the subtype:
+    colname <- paste0( "subtype.scores.", s, ".binary" )
+    
+    for(t in unique(df.plot$state))
+    {
+        df.plot$n[ df.plot$subtype==s & df.plot$state==t ] <- sum(pData(dCellData)[,colname][ pData(dCellData)$State==t ])
+    }
+}
+
+# nope that doesn't work
+#
+# try normalising scores and then taking max for each cell?
+phenoData(dCellData)$subtype.scores.mes.z <- scale(phenoData(dCellData)$subtype.scores.mes)
+phenoData(dCellData)$subtype.scores.rtki.z <- scale(phenoData(dCellData)$subtype.scores.rtki)
+phenoData(dCellData)$subtype.scores.rtkii.z <- scale(phenoData(dCellData)$subtype.scores.rtkii)
+# and also plot:
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_09_subtype_signature_score_z_dist.pdf" )
+pdf(outputname)
+qplot(phenoData(dCellData)$subtype.scores.mes.z, binwidth=0.1)
+qplot(phenoData(dCellData)$subtype.scores.rtki.z, binwidth=0.1)
+qplot(phenoData(dCellData)$subtype.scores.rtkii.z, binwidth=0.1)
+dev.off()
+#
+# okay so get a weird distribution for MES, but already seen in non-normaliesd scores
+#
+# subtype each cell by taking max of the z-score and then mapping to the subtype
+phenoData(dCellData)$subtype.scores.max <- apply( X=pData(dCellData)[ , c("subtype.scores.mes.z","subtype.scores.rtki.z","subtype.scores.rtkii.z") ],
+      MARGIN=1, function(row) c("MES","RTK_I","RTK_II")[row==max(row)] )
+
+# and project onto pseudotime
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_09a_subtype_signature_score_pseudotime_byMaxZScore.pdf" )
+pdf(outputname)
+plot_cell_trajectory(dCellData, color_by = "as.factor(subtype.scores.max)") + scale_color_manual(values=subtype.colours)
+# close plotting device
+dev.off()
+#
+# plot cell subtyping by state also
+# dplyr one-liner!
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_09a_subtype_signature_score_pseudotime_byMaxZScore_barplot.pdf" )
+pdf(outputname)
+ggplot(data=pData(dCellData) %>% group_by(State) %>% count(subtype.scores.max), aes(x=State, y=n, fill=subtype.scores.max)) + geom_bar(stat="identity") + scale_fill_manual(values=subtype.colours) + theme_bw()
+dev.off()
+
+############################################################
+#
+# next: calculate regulon expression and activity 
+# idea: we should see that clustering cells on regulon activity is better than raw MR expression
+# 
+# filter for the CRC MRs and remove genes with stdev in the lowest quartile
+#
+############################################################
+# source R code with functions, etc. from RTN analysis
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+# load saved Renv from end of rtn session
+message("Loading saved RTN Renv (may take some time)...")
+load(list.files()[ grep( x=list.files(), pattern="_combined_GBM_RTN_Renv.Rdata" ) ])
+
+# re-define working dir (as sourcing the rtn analysis common code changed it)
+setwd("/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/scRNAseq_Darmanis_2017/")
+
+# define MRs: load CRC results list
+
+# 2. load MR results: 
+# use new table based on definitions in email received 20190429 from Carl, saved in analysis dir
+# updated 20200801: use updated list of CRC MRs as per Fig 3E:
+# FOXD2 (not FOXD1), add IRF8, remove ZBTB7C for MES; FOXO1 (not FOXD1) for RTK_II
+# further update 20200821: re-add ZBTB7C as RTK_II MR
+path <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/scRNAseq_Darmanis_2017/CRC_MRs_20200821.csv"
+df.mrs <- read.csv(path)
+# check dims:
+dim(df.mrs) # should be 38 MRs with 2 columns (symbol + subtype)
+# take CIMP- only, i.e., remove the IDH MRs:
+df.mrs <- df.mrs[ df.mrs$subtype != "IDH", ]
+
+# extract mr symbols to feed into downstream code
+# take unique hits only:
+keep.mrs <- unique(df.mrs$symbol)
+# how many?
+length(keep.mrs)
+
+# as a list of gene sigs, use tni.get to extract netA/test network regulons:
+mr.regulons.test <- tni.get(rtni.test, what="regulons", idkey="SYMBOL")[keep.mrs]
+mr.regulons.validation <- tni.get(rtni.validation, what="regulons", idkey="SYMBOL")[keep.mrs]
+
+############################################################
+#
+# extract expression matrix, visualise zscores of expression of activated MRs
+#
+############################################################
+#
+# use extracted GX matrix from above (plotting of GOI)
+#
+################
+# viz MR expr (+ z-scores) as heatmap
+################
+# first: filter expr matrix only for the single tumour cells - drop CSCs + bulk
+# take only rows(=genes) in the CIMP- MR consensus set defined above
+mat.gx.filt.2.mr <- mat.gx.filt.2[ match(keep.mrs,rownames(mat.gx.filt.2)), ]
+
+# then calculate z-scores as well:
+mat.gx.filt.2.mr.z <- t( apply(X=mat.gx.filt.2.mr, MARGIN=1, FUN=scale) )
+colnames(mat.gx.filt.2.mr.z) <- colnames(mat.gx.filt.2.mr) # re-add colnames
+
+# for sample/column anno: use the annotations from the dCellData obj
+anno.df <- pData(dCellData)[,c("Selection","Sample.name","Total_reads","num_genes_expressed","Cluster_2d","Pseudotime","State")]
+# rename cols to more informative annotation names...
+colnames(anno.df) <- c("Immunopanning","Sample", "Total reads", "Expressed genes", "Cluster(Darmanis)", "Pseudotime", "Pseudotime Cluster")
+# change Pseudotime Cluster labels to more informative ones based on the trajectory above:
+anno.df$`Pseudotime Cluster` <- as.character(anno.df$`Pseudotime Cluster`)
+anno.df$`Pseudotime Cluster`[anno.df$`Pseudotime Cluster`=="1"] <- "RTK_I"
+anno.df$`Pseudotime Cluster`[anno.df$`Pseudotime Cluster`=="2"] <- "Transition"
+anno.df$`Pseudotime Cluster`[anno.df$`Pseudotime Cluster`=="3"] <- "RTK_II"
+anno.df$`Pseudotime Cluster`[anno.df$`Pseudotime Cluster`=="4"] <- "Mixed normal"
+anno.df$`Pseudotime Cluster`[anno.df$`Pseudotime Cluster`=="5"] <- "MES"
+# define colours for each annotation within a list of named vectors (categorical) or 
+ha.anno.cols <- list(
+		"Immunopanning"=brewer.pal(n=length(unique(anno.df$Immunopanning)),name="Set1"), 
+        "Sample"=brewer.pal(n=length(unique(anno.df$Sample)),name="Set2"), 
+        "Total reads"=colorRamp2(breaks=c(min(anno.df$`Total reads`),max(anno.df$`Total reads`)),colors=c("white","orange")),
+        "Expressed genes"=colorRamp2(breaks=c(min(anno.df$`Expressed genes`),max(anno.df$`Expressed genes`)),colors=c("white","blue")),
+        "Cluster(Darmanis)"=brewer.pal(n=length(unique(anno.df$`Cluster(Darmanis)`)),name="Set3"),
+		"Pseudotime"=colorRamp2(breaks=c(min(anno.df$Pseudotime),max(anno.df$Pseudotime)),colors=c("white","green")),
+        "Pseudotime Cluster"=brewer.pal(n=length(unique(anno.df$`Pseudotime Cluster`)),name="Accent")
+         )
+# add names to each vector for the HeatmapAnnotation function:
+names(ha.anno.cols$Immunopanning) <- unique(anno.df$Immunopanning)
+names(ha.anno.cols$Sample) <- unique(anno.df$Sample)
+names(ha.anno.cols$`Cluster(Darmanis)`) <- unique(anno.df$`Cluster(Darmanis)`)
+names(ha.anno.cols$`Pseudotime Cluster`) <- unique(anno.df$`Pseudotime Cluster`)
+
+# added 20190712: 
+# generate pseudotime plot coloured by source tumour
+# this is HERE because it needs the colours assigned in the above call of ha.anno.cols
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_07_pseudotime_bySampleColours.pdf" )
+pdf(outputname, height=6, width=6)
+plot_cell_trajectory(dCellData, color_by = "Sample.name", cell_size=0.75) + scale_colour_manual(values=ha.anno.cols$Sample)
+dev.off()
+
+# reorder before constructing 
+ha.anno <- HeatmapAnnotation( df=anno.df[match(colnames(mat.gx.filt.2.mr), rownames(anno.df)),], col=ha.anno.cols,
+                             which="column", show_annotation_name=TRUE, annotation_name_side="right"
+                            )
+
+# row annotation: use subtype of the MRs
+row.anno <- rowAnnotation( df=data.frame(subtype=df.mrs[match(keep.mrs, df.mrs$symbol),"subtype"]), col=list(subtype=subtype.colours) )
+
+# define colours:
+cols.gx <- c("white","orange")
+# plot heatmap:
+h <- Heatmap( as.matrix(mat.gx.filt.2.mr), col=cols.gx, name="Normalised\ncounts",
+#            clustering_method_rows="ward.D2", clustering_distance_rows="binary",
+#            clustering_method_columns="ward.D2", clustering_distance_columns="binary",
+            top_annotation=ha.anno, row_names_gp=gpar(fontsize=4), show_column_names=FALSE ) + row.anno
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_10_CRC_MR_expression_heatmap.pdf" )
+pdf(file=outputname, width=16, height=12)
+h
+dev.off()
+
+# do same for z-scores:
+# colours
+cols.z <- colorRamp2( breaks=c( min(mat.gx.filt.2.mr.z), -1, 0, 1, max(mat.gx.filt.2.mr.z) ), colors=rev(brewer.pal(5, "PuOr")) )
+h <- Heatmap( as.matrix(mat.gx.filt.2.mr.z), col=cols.z, name="z-scores of norm. counts", 
+#            clustering_method_rows="ward.D2", clustering_distance_rows="binary",
+#            clustering_method_columns="ward.D2", clustering_distance_columns="binary",
+            top_annotation=ha.anno, row_names_gp=gpar(fontsize=4), show_column_names=FALSE ) + row.anno
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_10_CRC_MR_expression_z-scores_heatmap.pdf" )
+pdf(file=outputname, width=16, height=12)
+h
+dev.off()
+
+############################################################
+#
+# filter and transform expression matrix
+#
+############################################################
+# now: calculate SDs for each row
+row.sds <- apply(X=mat.gx.filt.2, MARGIN=1, FUN=sd)
+# what do these look like?
+summary(row.sds)
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max.
+# 0.0000  0.1631  0.6873  0.7930  1.2771  4.4992
+#
+# so yeah, filter out everythign in the lowest quartile:
+mat.gx.filt.2 <- mat.gx.filt.2[ row.sds > summary(row.sds)[2], ]
+
+# check dims
+dim(mat.gx.filt.2)
+# should be 15653 genes remaining.
+
+# scale, then re-add the names
+mat.gx.filt.2 <- t(apply(mat.gx.filt.2, MARGIN=1, FUN=scale))
+colnames(mat.gx.filt.2) <- colnames(dCellData)
+
+############################################################
+# run VIPER on this filtered matrix:
+############################################################
+# first need to generate the 'regulon' objs used by the viper package
+# need to use aracne2regulon(), passing an ARACNe adjacency matrix + expression matrix
+#
+# Carl already scripted this so let's steal them from his VIPER analysis, eheh (viper.Rmd)
+#
+##############################
+# test/network A:
+##############################
+options(stringsAsFactors=T) # need to set to T otherwise aracne2regulon() breaks!
+ 
+## Extract the regulons
+regulons.test <- tni.get(rtni.test,what='regulons')
+tf.symb <- convertIDs(names(regulons.test),from='PROBEID',to='SYMBOL', hgu133a.db, ifMultiple = 'useFirst')
+names(regulons.test) <- tf.symb
+
+## extract the matrix with the MI values
+tnet.test <- tni.get(rtni.test,what='tnet')
+symb.row <- convertIDs(rownames(tnet.test),from='PROBEID',to='SYMBOL',hgu133a.db,ifMultiple = 'useFirst')
+symb.col <- convertIDs(colnames(tnet.test),from='PROBEID',to='SYMBOL',hgu133a.db,ifMultiple = 'useFirst')
+colnames(tnet.test) <- symb.col
+rownames(tnet.test) <- symb.row
+
+# get expression matrix
+exp.test <- tni.get(rtni.test,what='gexp')
+# fix rownames = map from probe ID to symbol
+symb.row <- convertIDs(rownames(exp.test),from='PROBEID',to='SYMBOL',hgu133a.db,ifMultiple = 'useFirst')
+rownames(exp.test) <- symb.row
+
+# convert the MI matrix to an ARACNe-format adjacency list
+regulons.test.3col <- do.call('rbind', lapply( names(regulons.test) ,function(tf) {
+  message(tf)
+  targets = regulons.test[[tf]]
+  targets.symb = convertIDs(targets,from='PROBEID',to='SYMBOL',hgu133a.db,ifMultiple = 'useFirst')
+  i = match(targets.symb,rownames(tnet.test))
+  j = match(tf,colnames(tnet.test))
+  mi = tnet.test[i,j]
+  names(mi) = NULL
+  data.frame(tf=rep(tf,length(targets)),targets=targets.symb,mi=mi)
+}))
+regulons.test.3col[,3] <- abs(regulons.test.3col[,3])
+# write to text table to read in in next step to create the regulon obj
+write.table(x=regulons.test.3col, file="./GBM_networkA_ARACNe.adj", quote=FALSE,sep='\t',col.names=FALSE,row.names=FALSE)
+
+# generate regulon object
+reg.viper.test <- aracne2regulon("./GBM_networkA_ARACNe.adj", exp.test, format='3col')
+
+##############################
+# validation/network B:
+##############################
+## Extract the regulons
+regulons.validation <- tni.get(rtni.validation,what='regulons')
+tf.symb <- convertIDs(names(regulons.validation),from='PROBEID',to='SYMBOL', hgu133plus2.db, ifMultiple = 'useFirst')
+names(regulons.validation) <- tf.symb
+## extract the matrix with the MI values
+tnet.validation <- tni.get(rtni.validation,what='tnet')
+symb.row <- convertIDs(rownames(tnet.validation),from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
+symb.col <- convertIDs(colnames(tnet.validation),from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
+colnames(tnet.validation) <- symb.col
+rownames(tnet.validation) <- symb.row
+# get expression matrix
+exp.validation <- tni.get(rtni.validation,what='gexp')
+# fix rownames = map from probe ID to symbol
+symb.row <- convertIDs(rownames(exp.validation),from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
+rownames(exp.validation) <- symb.row
+# convert the MI matrix to an ARACNe-format adjacency list
+regulons.validation.3col <- do.call('rbind', lapply( names(regulons.validation) ,function(tf) {
+  message(tf)
+  targets = regulons.validation[[tf]]
+  targets.symb = convertIDs(targets,from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
+  i = match(targets.symb,rownames(tnet.validation))
+  j = match(tf,colnames(tnet.validation))
+  mi = tnet.validation[i,j]
+  names(mi) = NULL
+  data.frame(tf=rep(tf,length(targets)),targets=targets.symb,mi=mi)
+}))
+regulons.validation.3col[,3] <- abs(regulons.validation.3col[,3])
+# write to text table to read in in next step to create the regulon obj
+write.table(x=regulons.validation.3col, file="./GBM_networkB_ARACNe.adj", quote=FALSE,sep='\t',col.names=FALSE,row.names=FALSE)
+# generate regulon obj
+reg.viper.validation <- aracne2regulon("./GBM_networkB_ARACNe.adj", exp.validation, format='3col')
+
+##############################
+# run viper analysis
+##############################
+# as input expr matrix: use the extracted GX mat for the single cells
+timestamp()
+viper.test <- viper( eset=mat.gx.filt.2, regulon=reg.viper.test, minsize = 3, method='scale', verbose = FALSE, cores=n.cores)
+timestamp()
+viper.validation <- viper( eset=mat.gx.filt.2, regulon=reg.viper.validation, minsize = 3, method='scale', verbose = FALSE, cores=n.cores)
+timestamp()
+# well quick with 32 cores (!)
+
+# now that was on *ALL* MRs
+# so filter this output matrix for the CRC MRs present in both
+keep.mrs.viper <- intersect(keep.mrs, intersect(rownames(viper.test), rownames(viper.validation)))
+viper.test.filt <- viper.test[ match(keep.mrs.viper, rownames(viper.test)), ]
+dim(viper.test.filt)
+viper.validation.filt <- viper.validation[ match(keep.mrs.viper, rownames(viper.validation)), ]
+dim(viper.validation.filt)
+
+############################################################
+# heatmap of MR activity for both networks
+############################################################
+# generate row annotations (same for both nets) from the MR list: 
+# order in same order as vector of CRC MRs to analyse
+row.anno.viper <- rowAnnotation(df=data.frame(subtype=df.mrs$subtype[match(keep.mrs.viper, df.mrs$symbol)]), col=list(subtype=subtype.colours))
+
+# netA
+# generate heatmap obj
+# colours for diffES heatmap
+cols.es <- colorRamp2( breaks=c(min(viper.test.filt),0,max(viper.test.filt)), colors=c("blue", "white", "red") )
+p <- Heatmap( viper.test.filt, col=cols.es, name="ssGSEA ES", 
+              cluster_columns=TRUE, cluster_rows=TRUE,
+              # define distances for clustering rows/cols
+              clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+              # define clustering methods also
+              clustering_method_rows="average", clustering_method_columns="average",
+              show_row_dend=TRUE, row_names_gp = gpar(fontsize=8),
+              show_row_names=TRUE, column_title_gp = gpar(fontsize = 10),
+              show_column_names=FALSE, top_annotation=ha.anno ) + row.anno.viper
+# output as PDF: 
+outputprefix <- paste0( Sys.Date(), "_monocle_analysis_allCells_11_CRC_MR_netA_regulon_activity_heatmap" )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=16, height=12)
+print(p)
+dev.off()
+
+# new 20190515: 
+# split cells/columns by pseudotime state
+#
+# rationale: make a simpler version of this heatmap for the manuscript
+# message: "we can use MR activity to find subcategories within pseudotime states - this is likely tumour vs normal"
+#
+# generate a list of heatmaps, splitting the input VIPER activity matrix by pseudotime state.
+#
+# firstly: split the VIPER matrix by cols into pseudotime states; 
+# in parallel, generate new heatmap col annotations for these split matrices (show name only for last/right-hand-most heatmap!)
+# keep the same heatmap annotaiton colours as for the full heatmaps (show legends only for last heatmap!)
+#
+# state 1: RTK_I
+viper.test.filt.state1 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="RTK_I"], colnames(viper.test.filt)) ]
+ha.anno.state1 <- HeatmapAnnotation( df=anno.df[match(colnames(viper.test.filt.state1), rownames(anno.df)),], col=ha.anno.cols, show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right" )
+# state 2: RTK_II - MES/RTK_I
+viper.test.filt.state2 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="Transition"], colnames(viper.test.filt)) ]
+ha.anno.state2 <- HeatmapAnnotation( df=anno.df[match(colnames(viper.test.filt.state2), rownames(anno.df)),],  col=ha.anno.cols, show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right" )
+# state 3: RTK_II
+viper.test.filt.state3 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="RTK_II"], colnames(viper.test.filt)) ]
+ha.anno.state3 <- HeatmapAnnotation( df=anno.df[match(colnames(viper.test.filt.state3), rownames(anno.df)),],  col=ha.anno.cols, show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right")
+# state 4: RTK_I
+viper.test.filt.state4 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="Mixed normal"], colnames(viper.test.filt)) ]
+ha.anno.state4 <- HeatmapAnnotation( df=anno.df[match(colnames(viper.test.filt.state4), rownames(anno.df)),],  col=ha.anno.cols, show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right")
+# state 5: MES/microglia
+viper.test.filt.state5 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="MES"], colnames(viper.test.filt)) ]
+ha.anno.state5 <- HeatmapAnnotation( df=anno.df[match(colnames(viper.test.filt.state5), rownames(anno.df)),],  col=ha.anno.cols,
+                             which="column", show_annotation_name=TRUE, annotation_name_side="right")
+
+# generate heatmap list:
+# only show row names for last heatmap!
+p <- Heatmap( viper.test.filt.state1, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=TRUE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=TRUE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state1 ) + 
+	Heatmap( viper.test.filt.state2, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=TRUE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=TRUE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state2 ) + 
+	Heatmap( viper.test.filt.state3, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=TRUE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=TRUE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state3 ) + 
+	Heatmap( viper.test.filt.state4, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=TRUE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=TRUE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state4 ) + 
+	Heatmap( viper.test.filt.state5, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=TRUE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=TRUE, row_names_gp = gpar(fontsize=8), show_row_names=TRUE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state5 ) + 						
+			# MR row annotations 
+			row.anno.viper
+# output as PDF: 
+outputprefix <- paste0( Sys.Date(), "_monocle_analysis_allCells_11_CRC_MR_netA_regulon_activity_heatmap_splitPST" )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=16, height=12)
+print(p)
+dev.off()
+
+#########################
+#
+# plot "stripped" version of this pseudotime state-split heatmap, 
+# ordering MRs by subtype, and showing sample annotation only
+# new code added 20190704, see ipynb 20190626
+#
+#########################
+# adapt code from the Rscript for analysis: do 2 things here
+#
+# first:
+# reorder viper.test.filt to follow order in the df.mrs df
+df.mrs <- df.mrs[df.mrs$symbol %in% rownames(viper.test.filt),]# first remove MRs not in here
+viper.test.filt <- viper.test.filt[ match(df.mrs$symbol, rownames(viper.test.filt)),  ]
+# regenerate the row anno for this:
+# order in same order as vector of CRC MRs to analyse
+row.anno.viper <- rowAnnotation(df=data.frame(subtype=df.mrs$subtype[match(keep.mrs.viper, df.mrs$symbol)]), col=list(subtype=subtype.colours))
+
+# now:
+#
+# gen new column anno for each state, with sample information only
+# state 1: RTK_I
+viper.test.filt.state1 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="RTK_I"], colnames(viper.test.filt)) ]
+ha.anno.state1 <- HeatmapAnnotation( df=data.frame(Sample=anno.df[match(colnames(viper.test.filt.state1), rownames(anno.df)),"Sample"]), col=list(Sample=ha.anno.cols$Sample), show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right" )
+# state 2: RTK_II - MES/RTK_I
+viper.test.filt.state2 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="Transition"], colnames(viper.test.filt)) ]
+ha.anno.state2 <- HeatmapAnnotation( df=data.frame(Sample=anno.df[match(colnames(viper.test.filt.state2), rownames(anno.df)),"Sample"]), col=list(Sample=ha.anno.cols$Sample), show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right" )
+# state 3: RTK_II
+viper.test.filt.state3 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="RTK_II"], colnames(viper.test.filt)) ]
+ha.anno.state3 <- HeatmapAnnotation( df=data.frame(Sample=anno.df[match(colnames(viper.test.filt.state3), rownames(anno.df)),"Sample"]), col=list(Sample=ha.anno.cols$Sample), show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right")
+# state 4: RTK_I
+viper.test.filt.state4 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="Mixed normal"], colnames(viper.test.filt)) ]
+ha.anno.state4 <- HeatmapAnnotation( df=data.frame(Sample=anno.df[match(colnames(viper.test.filt.state4), rownames(anno.df)),"Sample"]), col=list(Sample=ha.anno.cols$Sample), show_legend=FALSE,
+                             which="column", show_annotation_name=F, annotation_name_side="right")
+# state 5: MES/microglia
+viper.test.filt.state5 <- viper.test.filt[ , match( rownames(anno.df)[anno.df$`Pseudotime Cluster`=="MES"], colnames(viper.test.filt)) ]
+ha.anno.state5 <- HeatmapAnnotation( df=data.frame(Sample=anno.df[match(colnames(viper.test.filt.state5), rownames(anno.df)),"Sample"]),  col=list(Sample=ha.anno.cols$Sample), show_legend=TRUE,
+                             which="column", show_annotation_name=TRUE, annotation_name_side="right")
+
+# heatmap colours:
+# match blue-yellow palette of Viridis; use three colours to get the right shades to match the pseudotime plots
+# need to use viridis func from viridisLite package:
+cols.es <- colorRamp2( breaks=c(min(viper.test.filt),0,max(viper.test.filt)), colors=viridisLite::viridis(n=3, option="E") )
+
+# remove the annotations and do not show dendrogs
+# generate heatmap list:
+# only show row names for last heatmap!
+p <- Heatmap( viper.test.filt.state1, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state1 ) + 
+	Heatmap( viper.test.filt.state2, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state2 ) + 
+	Heatmap( viper.test.filt.state3, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state3 ) + 
+	Heatmap( viper.test.filt.state4, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state4 ) + 
+	Heatmap( viper.test.filt.state5, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=TRUE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state5 ) + 						
+			# MR row annotations 
+			row.anno.viper
+# output as PDF: 
+outputprefix <- paste0( Sys.Date(), "_monocle_analysis_allCells_11_CRC_MR_netA_regulon_activity_heatmap_splitPST_clean" )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=16, height=12)
+print(p)
+dev.off()
+
+# also rasterise for ease of editing
+p <- Heatmap( viper.test.filt.state1, use_raster=TRUE,
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state1 ) + 
+	Heatmap( viper.test.filt.state2, use_raster=TRUE, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state2 ) + 
+	Heatmap( viper.test.filt.state3,  use_raster=TRUE,
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state3 ) + 
+	Heatmap( viper.test.filt.state4,  use_raster=TRUE,
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=FALSE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state4 ) + 
+	Heatmap( viper.test.filt.state5, use_raster=TRUE, 
+			col=cols.es, name="ssGSEA ES",  cluster_columns=TRUE, cluster_rows=FALSE,
+            # define distances for clustering rows/cols
+            clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+            # define clustering methods also
+            clustering_method_rows="average", clustering_method_columns="average",
+            show_row_dend=FALSE, show_column_dend=FALSE, row_names_gp = gpar(fontsize=8), show_row_names=TRUE, column_title_gp = gpar(fontsize = 10),
+            show_column_names=FALSE, top_annotation=ha.anno.state5 ) + 						
+			# MR row annotations 
+			row.anno.viper
+# output as PDF: 
+outputprefix <- paste0( Sys.Date(), "_monocle_analysis_allCells_11_CRC_MR_netA_regulon_activity_heatmap_splitPST_clean_rasterise" )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=16, height=12)
+print(p)
+dev.off()
+
+# netB
+# re-generate row annotations from the MR list:
+# order in same order as vector of CRC MRs to analyse
+row.anno.viper <- rowAnnotation(df=data.frame(subtype=df.mrs$subtype[match(keep.mrs.viper, df.mrs$symbol)]), col=list(subtype=subtype.colours))
+
+# generate heatmap obj
+# colours for diffES heatmap
+cols.es <- colorRamp2( breaks=c(min(viper.validation.filt),0,max(viper.validation.filt)), colors=c("blue", "white", "red") )
+p <- Heatmap( viper.validation.filt, col=cols.es, name="ssGSEA ES", 
+              cluster_columns=TRUE, cluster_rows=TRUE,
+              # define distances for clustering rows/cols
+              clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
+              # define clustering methods also
+              clustering_method_rows="average", clustering_method_columns="average",
+              show_row_dend=TRUE, row_names_gp = gpar(fontsize=8),
+              show_row_names=TRUE, column_title_gp = gpar(fontsize = 10),
+              show_column_names=FALSE, top_annotation=ha.anno ) + row.anno.viper
+# output as PDF: 
+outputprefix <- paste0( Sys.Date(), "_monocle_analysis_allCells_11_CRC_MR_netB_regulon_activity_heatmap" )
+# generate outputname
+outputname <- paste( outputprefix, "pdf", sep="." )
+# open plotting device
+pdf(file=outputname, width=16, height=12)
+print(p)
+dev.off()
+
+############################################################
+#
+# visualise a "subtype MR activity" score on the pseudotime
+#      1. calculate z-scores of CRC MR activity, for each MR across all cells
+#            i.e. normalise the GSEA scores to the same scale
+#      2. for each subtype MR set: calculate mean of the z-transformed dES
+#            then take max and use as the subtype:
+#
+############################################################
+# first: transform to z-scores
+viper.test.filt.z <- t( apply(X=viper.test.filt, MARGIN=1, FUN=scale) )
+viper.validation.filt.z <- t( apply(X=viper.validation.filt, MARGIN=1, FUN=scale) )
+# re-add colnames
+colnames(viper.test.filt.z) <- colnames(viper.test.filt) 
+colnames(viper.validation.filt.z) <- colnames(viper.validation.filt) 
+
+# for each subtype/network: calculate mean of the normalised scores, for each cell
+pData(dCellData)$regulons.test.mes.mean <- colMeans(viper.test.filt.z[ rownames(viper.test.filt.z) %in% df.mrs$symbol[df.mrs$subtype=="MES"], ])
+pData(dCellData)$regulons.test.rtki.mean <- colMeans(viper.test.filt.z[ rownames(viper.test.filt.z) %in% df.mrs$symbol[df.mrs$subtype=="RTK_I"], ])
+pData(dCellData)$regulons.test.rtkii.mean <- colMeans(viper.test.filt.z[ rownames(viper.test.filt.z) %in% df.mrs$symbol[df.mrs$subtype=="RTK_II"], ])
+pData(dCellData)$regulons.validation.mes.mean <- colMeans(viper.validation.filt.z[ rownames(viper.validation.filt.z) %in% df.mrs$symbol[df.mrs$subtype=="MES"], ])
+pData(dCellData)$regulons.validation.rtki.mean <- colMeans(viper.validation.filt.z[ rownames(viper.validation.filt.z) %in% df.mrs$symbol[df.mrs$subtype=="RTK_I"], ])
+pData(dCellData)$regulons.validation.rtkii.mean <- colMeans(viper.validation.filt.z[ rownames(viper.validation.filt.z) %in% df.mrs$symbol[df.mrs$subtype=="RTK_II"], ])
+#
+# subtype each cell by taking max of the z-score and then mapping to the subtype
+phenoData(dCellData)$regulons.test.max <- apply( X=pData(dCellData)[ , c("regulons.test.mes.mean","regulons.test.rtki.mean","regulons.test.rtkii.mean") ],
+      MARGIN=1, function(row) c("MES","RTK_I","RTK_II")[row==max(row)] )
+phenoData(dCellData)$regulons.validation.max <- apply( X=pData(dCellData)[ , c("regulons.validation.mes.mean","regulons.validation.rtki.mean","regulons.validation.rtkii.mean") ],
+      MARGIN=1, function(row) c("MES","RTK_I","RTK_II")[row==max(row)] )
+
+# what do we get?
+table(phenoData(dCellData)$regulons.test.max)
+#   MES  RTK_I RTK_II
+#  1672   1040    877
+table(phenoData(dCellData)$regulons.validation.max)
+#   MES  RTK_I RTK_II
+#  1737   920    932
+#
+# so, v. comparable between networks
+
+# plot on pseudotime trajectory:
+# netA
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_12_pseudotime_byMaxSubtypeRegulonActivity_netA.pdf" )
+pdf(outputname)
+plot_cell_trajectory(dCellData, color_by = "as.factor(regulons.test.max)") + scale_color_manual(values=subtype.colours)
+# close plotting device
+dev.off()
+# netB
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_12_pseudotime_byMaxSubtypeRegulonActivity_netB.pdf" )
+pdf(outputname)
+plot_cell_trajectory(dCellData, color_by = "as.factor(regulons.validation.max)") + scale_color_manual(values=subtype.colours)
+# close plotting device
+dev.off()
+
+# also plot the subtype per cluster (as done with the limma GX sigs above)
+# dplyr one-liner!
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_12_pseudotime_byMaxSubtypeRegulonActivity_netA_barplot.pdf" )
+pdf(outputname)
+ggplot(data=pData(dCellData) %>% group_by(State) %>% count(regulons.test.max), aes(x=State, y=n, fill=regulons.test.max)) + geom_bar(stat="identity") + scale_fill_manual(values=subtype.colours) + theme_bw()
+dev.off()
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_12_pseudotime_byMaxSubtypeRegulonActivity_netB_barplot.pdf" )
+pdf(outputname)
+ggplot(data=pData(dCellData) %>% group_by(State) %>% count(regulons.validation.max), aes(x=State, y=n, fill=regulons.validation.max)) + geom_bar(stat="identity") + scale_fill_manual(values=subtype.colours) + theme_bw()
+dev.off()
+
+############################################################
+#
+# doesn't look too bad at all... if anything better than with the raw GX sigs, unsurprisingly!
+#
+############################################################
+#
+# so also visualise the per-MR activity on the full trajectory:
+#
+###########################################################
+#####
+# add back in the MR activity to phenoData slot of dCellData obj
+#####
+# filter for unique rows in case there are MRs appearing >1 times
+viper.test.filt.z <- unique(viper.test.filt.z)
+viper.validation.filt.z <- unique(viper.validation.filt.z)
+# add in "MR_activity_" to rownames of the matrix with z-scores of regulon activity
+rownames(viper.test.filt.z) <- paste0( "MRactivity_netA_", rownames(viper.test.filt.z) )
+rownames(viper.validation.filt.z) <- paste0( "MRactivity_netB_", rownames(viper.validation.filt.z) )
+
+# are the cell names/columns in this z-score matrix in the same order as rows in the phenoData?
+table( colnames(viper.test.filt.z) == rownames(pData(dCellData)) )
+table( colnames(viper.validation.filt.z) == rownames(pData(dCellData)) )
+# all TRUE = good; can just add in with cbind
+pData(dCellData) <- cbind( pData(dCellData), t(viper.test.filt.z) )
+pData(dCellData) <- cbind( pData(dCellData), t(viper.validation.filt.z) )
+
+# now: loop over all these MRactivity profiles and plot on the pseudotime trajectory:
+# netA
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_13_pseudotime_byMRactivity_netA.pdf" )
+pdf(outputname, height=6, width=6)
+# loop over the rows/MR activity profiles of the matrix:
+for( g in rownames(viper.test.filt.z) ) 
+{
+    message(g)
+        
+    # print inside a for() loop
+    # plot_cell_trajectory returns a ggplot obj!
+    # colour by GOI expr, smaller point size
+    # add rug geoms - BROKEN
+	# use 'cividis' viridis palette, manually defined as monocle doesn't play nice;
+	#       want a colour scale with "neutral" colours for midpoings ~ 0
+    print(plot_cell_trajectory(dCellData, color_by=g, cell_size=0.75 ) + #geom_rug(aes(colour=g)) +
+          scale_colour_viridis_c(option="E", breaks=c( min(pData(dCellData)[,g]),0,max(pData(dCellData)[,g])) ) 
+         )
+}
+dev.off()
+
+# netB
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_13_pseudotime_byMRactivity_netB.pdf" )
+pdf(outputname, height=6, width=6)
+# loop over the rows/MR activity profiles of the matrix:
+for( g in rownames(viper.validation.filt.z) ) 
+{
+    message(g)
+        
+    # print inside a for() loop
+    # plot_cell_trajectory returns a ggplot obj!
+    # colour by GOI expr, smaller point size
+    # add rug geoms - BROKEN
+	# use 'cividis' viridis palette, manually defined as monocle doesn't play nice;
+	#       want a colour scale with "neutral" colours for midpoings ~ 0
+    print(plot_cell_trajectory(dCellData, color_by=g, cell_size=0.75 ) + #geom_rug(aes(colour=g)) +
+          scale_colour_viridis_c(option="E", breaks=c( min(pData(dCellData)[,g]),0,max(pData(dCellData)[,g])) )  
+         )
+}
+dev.off()
+
+############################################################
+#
+# Decompose the MES pseudotime state branch based on MR activity into cell populations of tumour and microglia/macrophage
+#
+# then visualise marker gene expr and MR activity 
+#
+# code from 20190425
+#
+############################################################
+# load lib for Rtsne
+suppressMessages(library(Rtsne))
+# set seed for reproducibility
+set.seed(20190425)
+
+# get regulon activity matrix of the consensus MES MRs, for the 2112 MES cells
+# define MES MRs
+mrs.mes <- df.mrs$symbol[df.mrs$subtype=="MES"]
+# now: need to get the cells from the pseudotime state corresponding to MES/macrophages/microglia = State 5
+keep.cells <- rownames(phenoData(dCellData))[ phenoData(dCellData)$State==5 ]
+
+# extract regulon activity from the viper matrix
+# set rows = samples, cols = MRs
+mat.tsne <- viper.test.filt[ rownames(viper.test.filt) %in% mrs.mes, match(keep.cells, colnames(viper.test.filt)) ]
+mat.tsne <- t(mat.tsne)
+
+# run tSNE
+tsne <- Rtsne(X=mat.tsne)
+
+# extract x/y coords as ggplot df
+# each row = 1 cell and either x or y coord
+plot.df.tsne.mes <- as.data.frame(tsne$Y)
+colnames(plot.df.tsne.mes) <- c("X","Y")
+rownames(plot.df.tsne.mes) <- keep.cells
+
+# plot
+outputname <- paste0( Sys.Date(), "_CRC_MES_MR_activity_MES_pseudotime_cells_tSNE.pdf")
+pdf(outputname)
+ggplot(data=as.data.frame(plot.df.tsne.mes), aes(x=X, y=Y)) + geom_point() + 
+theme_bw() + 
+ggtitle("tSNE of CRC MES MR activity matrix for 2112 MES single cells")
+dev.off()
+
+# now also get the marker gene expression, MRs, add to plotting df, visualise on the tSNE:
+#
+list.goi.mes <- c("AIF1","ITGAM","PTPRC","CD44","SERPINE1", keep.mrs.viper)
+# open output
+outputname <- paste0( Sys.Date(), "_CRC_MES_MR_activity_MES_pseudotime_cells_tSNE_markerExpr.pdf")
+pdf(outputname)
+# for loop:
+for(g in list.goi.mes)
+{
+	# fetch GX info and add to 
+    message(g)
+    
+    # add GX to plotting df:
+    plot.df.tsne.mes$GOI <- mat.gx.filt.2[ rownames(mat.gx.filt.2) %in% g, match( rownames(plot.df.tsne.mes), colnames(mat.gx.filt.2) ) ]
+
+    # plot
+    # print in a for() loop
+    print( 
+        ggplot(data=as.data.frame(plot.df.tsne.mes), aes(x=X, y=Y, colour=GOI)) + geom_point() + 
+        theme_bw() + 
+        ggtitle(paste0("tSNE of MES MR activity matrix for 2112 MES single cells\nColoured by ",g, " expression (VST norm.)")) +
+        scale_colour_viridis_c(option="D", breaks=c( min(plot.df.tsne.mes$GOI),0,max(plot.df.tsne.mes$GOI)) )  
+     )
+}
+dev.off()
+
+# finally: add in MR activity for the MRs, then plot:
+#
+# netA:
+outputname <- paste0( Sys.Date(), "_CRC_MES_MR_activity_MES_pseudotime_cells_tSNE_MRactivity_netA.pdf")
+pdf(outputname)
+# open for loop over all MES MRs in the filtered activity matrix
+for( mr in mrs.mes[mrs.mes %in% rownames(viper.test.filt)] )
+{
+    message(mr)
+    
+    # add MR activity to plotting df:
+    plot.df.tsne.mes$MRactivity <- viper.test.filt[ rownames(viper.test.filt) %in% mr, match( rownames(plot.df.tsne.mes), colnames(viper.test.filt) ) ]
+
+    # plot
+    # print in a for() loop
+    print( 
+        ggplot(data=as.data.frame(plot.df.tsne.mes), aes(x=X, y=Y, colour=MRactivity)) + geom_point() + 
+        theme_bw() + 
+        ggtitle(paste0("tSNE of MES MR activity matrix for 2112 MES single cells\nColoured by ",mr, " activity (network A)")) +
+        scale_colour_viridis_c(option="E", breaks=c( min(plot.df.tsne.mes$MRactivity),0,max(plot.df.tsne.mes$MRactivity)) )  
+     )
+    
+}
+dev.off()
+# netB:
+outputname <- paste0( Sys.Date(), "_CRC_MES_MR_activity_MES_pseudotime_cells_tSNE_MRactivity_netB.pdf")
+pdf(outputname)
+# open for loop over all MES MRs in the filtered activity matrix
+for( mr in mrs.mes[mrs.mes %in% rownames(viper.validation.filt)] )
+{
+    message(mr)
+    
+    # add MR activity to plotting df:
+    plot.df.tsne.mes$MRactivity <- viper.validation.filt[ rownames(viper.validation.filt) %in% mr, match( rownames(plot.df.tsne.mes), colnames(viper.validation.filt) ) ]
+
+    # plot
+    # print in a for() loop
+    print( 
+        ggplot(data=as.data.frame(plot.df.tsne.mes), aes(x=X, y=Y, colour=MRactivity)) + geom_point() + 
+        theme_bw() + 
+        ggtitle(paste0("tSNE of MES MR activity matrix for 2112 MES single cells\nColoured by ",mr, " activity (network B)")) +
+        scale_colour_viridis_c(option="E", breaks=c( min(plot.df.tsne.mes$MRactivity),0,max(plot.df.tsne.mes$MRactivity)) )  
+     )
+    
+}
+dev.off()
+
+##################
+#
+#  NEW 20200802 - produce Violin plots of MR activity for MES MRs in these plots:
+#     address Nat Comms reviewer concerns,
+#     to show that the "immune-only" MRs are not necessarily UNIQUELY active in the microglia/macrophages
+#
+##################
+# firstly, add annotation of the cells based on this MR activity tSNE:
+# we have presumed anything with Y > 25 is a MES tumour cell, anything with Y < 25 is a microglia/macrophage.
+# how many of teach?
+table(plot.df.tsne.mes$Y>25)
+# FALSE  TRUE
+# 1832   280 
+# so most cells are the immune cells.
+#
+# add that annotation:
+plot.df.tsne.mes$cell_type <- plot.df.tsne.mes$Y>25
+plot.df.tsne.mes$cell_type[plot.df.tsne.mes$cell_type==TRUE] <- "MES tumour cell"
+plot.df.tsne.mes$cell_type[plot.df.tsne.mes$cell_type=="FALSE"] <- "microglia/macrophage"
+
+# next: add in the MR activities from the tSNE matrix of MR activities; same #rows and rownames (= cell IDs) so merge
+plot.df.tsne.mes <- merge(plot.df.tsne.mes, mat.tsne, by="row.names")
+
+# produce ggplot-style df:
+plot.df.tsne.mes.by.celltype.mrs <- data.frame(
+	cell_type=plot.df.tsne.mes$cell_type,
+	MR=rep(mrs.mes, each=nrow(plot.df.tsne.mes)),
+	MRactivity=unlist(plot.df.tsne.mes[,mrs.mes])
+	)
+
+# output as beeswarm plots:
+# wrap by facets of MR
+outputname <- paste0( Sys.Date(), "_CRC_MES_MR_activity_MES_pseudotime_cells_MRactivity_by_celltype.pdf" )
+pdf(outputname, height=10, width=6)
+print( ggplot(data=plot.df.tsne.mes.by.celltype.mrs, aes(x=cell_type, y=MRactivity)) + 
+           geom_quasirandom(size=0.001) +
+           theme_bw() + xlab(NULL) + ylab("MR activity (VIPER ES)") +
+		   facet_wrap(~MR) + theme_bw() + theme(axis.text.x=element_text(angle=45, size=8, vjust=0.60))
+         )
+dev.off()
+
+############################################################
+#
+# new 20190515:
+# Decompose the RTK_I pseudotime state branch based on MR activity into cell populations of tumour and oligos
+#
+# (as a reviewer may well want this...!)
+#
+############################################################
+# get regulon activity matrix of the consensus MES MRs, for the RTK_I cells
+# define RTK_I MRs
+# 20190524 change: use all MRs.
+mrs.rtki <- df.mrs$symbol
+# now: need to get the cells from the pseudotime state corresponding to RTK_I = state 1
+keep.cells <- rownames(phenoData(dCellData))[ phenoData(dCellData)$State==1 ]
+
+# extract regulon activity from the viper matrix
+# set rows = samples, cols = MRs
+mat.tsne <- viper.test.filt[ rownames(viper.test.filt) %in% mrs.rtki, match(keep.cells, colnames(viper.test.filt)) ]
+mat.tsne <- t(mat.tsne)
+
+# run tSNE
+tsne <- Rtsne(X=mat.tsne)
+
+# extract x/y coords as ggplot df
+# each row = 1 cell and either x or y coord
+plot.df.tsne.rtki <- as.data.frame(tsne$Y)
+colnames(plot.df.tsne.rtki) <- c("X","Y")
+rownames(plot.df.tsne.rtki) <- keep.cells
+
+# plot
+outputname <- paste0( Sys.Date(), "_CRC_RTK_I_MR_activity_RTK_I_pseudotime_cells_tSNE.pdf")
+pdf(outputname)
+ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y)) + geom_point() + 
+theme_bw() + 
+ggtitle("tSNE of CRC RTK_I MR activity matrix for 542 RTK_I single cells")
+dev.off()
+
+# now also get the marker gene expression, add to plotting df, visualise on the tSNE
+plot.df.tsne.rtki$SOX10 <- mat.gx.filt.2[ rownames(mat.gx.filt.2) %in% "SOX10", match( rownames(plot.df.tsne.rtki), colnames(mat.gx.filt.2) ) ]
+plot.df.tsne.rtki$PDGFRA <- mat.gx.filt.2[ rownames(mat.gx.filt.2) %in% "PDGFRA", match( rownames(plot.df.tsne.rtki), colnames(mat.gx.filt.2) ) ]
+plot.df.tsne.rtki$PLP1 <- mat.gx.filt.2[ rownames(mat.gx.filt.2) %in% "PLP1", match( rownames(plot.df.tsne.rtki), colnames(mat.gx.filt.2) ) ]
+plot.df.tsne.rtki$CNTN2 <- mat.gx.filt.2[ rownames(mat.gx.filt.2) %in% "CNTN2", match( rownames(plot.df.tsne.rtki), colnames(mat.gx.filt.2) ) ] 
+plot.df.tsne.rtki$ERBB3 <- mat.gx.filt.2[ rownames(mat.gx.filt.2) %in% "ERBB3", match( rownames(plot.df.tsne.rtki), colnames(mat.gx.filt.2) ) ] 
+
+# now output plots, for each marker in turn
+outputname <- paste0( Sys.Date(), "_CRC_RTK_I_MR_activity_RTK_I_pseudotime_cells_tSNE_markerExpr.pdf")
+pdf(outputname)
+# AIF1
+ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y, colour=SOX10)) + geom_point() + 
+theme_bw() + ggtitle("tSNE of CRC RTK_I MR activity matrix for 542 RTK_I single cells\nColoured by SOX10 expression") +
+scale_colour_viridis_c(option="D", breaks=c(min(plot.df.tsne.rtki$SOX10),0,max(plot.df.tsne.rtki$SOX10))) 
+# PDGFRA
+ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y, colour=PDGFRA)) + geom_point() + 
+theme_bw() + ggtitle("tSNE of CRC RTK_I MR activity matrix for 542 RTK_I single cells\nColoured by PDGFRA expression") +
+scale_colour_viridis_c(option="D", breaks=c(min(plot.df.tsne.rtki$PDGFRA),0,max(plot.df.tsne.rtki$PDGFRA))) 
+# PLP1
+ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y, colour=PLP1)) + geom_point() + 
+theme_bw() + ggtitle("tSNE of CRC RTK_I MR activity matrix for 542 RTK_I single cells\nColoured by PLP1 expression") +
+scale_colour_viridis_c(option="D", breaks=c(min(plot.df.tsne.rtki$PLP1),0,max(plot.df.tsne.rtki$PLP1))) 
+# MYT1
+ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y, colour=CNTN2)) + geom_point() + 
+theme_bw() + ggtitle("tSNE of CRC RTK_I MR activity matrix for 542 RTK_I single cells\nColoured by CNTN2 expression") +
+scale_colour_viridis_c(option="D", breaks=c(min(plot.df.tsne.rtki$CNTN2),0,max(plot.df.tsne.rtki$CNTN2))) 
+# ERBB3
+ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y, colour=ERBB3)) + geom_point() + 
+theme_bw() + ggtitle("tSNE of CRC RTK_I MR activity matrix for 542 RTK_I single cells\nColoured by ERBB3 expression") +
+scale_colour_viridis_c(option="D", breaks=c(min(plot.df.tsne.rtki$ERBB3),0,max(plot.df.tsne.rtki$ERBB3))) 
+# close plotting device
+dev.off()
+
+# finally: add in MR activity for the MRs, then plot:
+#
+# netA:
+outputname <- paste0( Sys.Date(), "_CRC_RTK_I_MR_activity_RTK_I_pseudotime_cells_tSNE_MRactivity_netA.pdf")
+pdf(outputname)
+# open for loop over all RTK_I MRs in the filtered activity matrix
+for( mr in mrs.rtki[mrs.rtki %in% rownames(viper.test.filt)] )
+{
+    message(mr)
+    
+    # add MR activity to plotting df:
+    plot.df.tsne.rtki$MRactivity <- viper.test.filt[ rownames(viper.test.filt) %in% mr, match( rownames(plot.df.tsne.rtki), colnames(viper.test.filt) ) ]
+
+    # plot
+    # print in a for() loop
+    print( 
+        ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y, colour=MRactivity)) + geom_point() + 
+        theme_bw() + 
+        ggtitle(paste0("tSNE of RTK_I MR activity matrix for 542 RTK_I single cells\nColoured by ",mr, " activity (network A)")) +
+        scale_colour_viridis_c(option="E", breaks=c( min(plot.df.tsne.rtki$MRactivity),0,max(plot.df.tsne.rtki$MRactivity)) )  
+     )
+    
+}
+dev.off()
+# netA:
+outputname <- paste0( Sys.Date(), "_CRC_RTK_I_MR_activity_RTK_I_pseudotime_cells_tSNE_MRactivity_netB.pdf")
+pdf(outputname)
+# open for loop over all RTK_I MRs in the filtered activity matrix
+for( mr in mrs.rtki[mrs.rtki %in% rownames(viper.validation.filt)] )
+{
+    message(mr)
+    
+    # add MR activity to plotting df:
+    plot.df.tsne.rtki$MRactivity <- viper.validation.filt[ rownames(viper.validation.filt) %in% mr, match( rownames(plot.df.tsne.rtki), colnames(viper.validation.filt) ) ]
+
+    # plot
+    # print in a for() loop
+    print( 
+        ggplot(data=as.data.frame(plot.df.tsne.rtki), aes(x=X, y=Y, colour=MRactivity)) + geom_point() + 
+        theme_bw() + 
+        ggtitle(paste0("tSNE of RTK_I MR activity matrix for 542 RTK_I single cells\nColoured by ",mr, " activity (network B)")) +
+        scale_colour_viridis_c(option="E", breaks=c( min(plot.df.tsne.rtki$MRactivity),0,max(plot.df.tsne.rtki$MRactivity)) )  
+     )
+    
+}
+dev.off()
+
+############################################################
+#
+# calculate normal brain cell signature scores for each state
+# new code 20190704, see ipynb 20190529
+#
+############################################################
+#####
+# define genes: use *all* the celltype genes from the meta analysis
+#
+# filter for:
+# 1. genes in this sc expr matrix
+# 2. 
+#####
+# read in table:
+list.goi.sigs <- read.csv("./McKenzie_normal_brain_cell_markers_topHumEnrich.csv", stringsAsFactors=F)
+
+# filter for genes not in the expr mat:
+list.goi.sigs <- list.goi.sigs[ list.goi.sigs$gene %in% rownames(mat.gx.filt.2), ]
+
+# what's left?
+table(list.goi.sigs$Celltype)
+#ast end mic neu oli
+#858 909 809 859 859
+#
+# so comparable numbers across cell types; good.
+#
+#########################
+#
+# for the genes in these sigs: calculate bg expr
+#
+#########################
+gc() # clean up before starting...
+# calculate over all cell IDs (will take some time...! parallelise with mclapply)
+# for ~4300 genes here: 2x as many as for subtype genes so ~1h or so?
+timestamp() # 
+marker.genes.expr.bg <- mclapply( X=colnames(mat.gx.filt.2), FUN=function(col) {
+    message(col)
+    sapply(X=list.goi.sigs$gene, FUN=calc.bg.expr, gx.profile=mat.gx.filt.2[,col])
+}, mc.cores=n.cores )
+timestamp() # takes... quite a while!
+
+# some fail?
+# so rerun them: find indices of empty results
+failed <- which(unlist(lapply(1:length(marker.genes.expr.bg), function(x) length(marker.genes.expr.bg[x][[1]]))) == 0)
+
+# use a while loop: are there are failed entries,
+while( length(failed) > 0 )
+{
+    # rerun:
+    rerun.failed <- mclapply( X=failed, FUN=function(index) {
+        message(index)
+        sapply(X=list.goi.sigs$gene, FUN=calc.bg.expr, gx.profile=mat.gx.filt.2[,index])
+    }, mc.cores=n.cores )
+
+    # check if there are any empty results still
+    table(unlist(lapply(1:length(rerun.failed), function(x) length(rerun.failed[x][[1]]))) == 0)
+    
+    # based on indices can add back in to the original output list:
+    for( i in failed )
+        {
+            marker.genes.expr.bg[i] <- rerun.failed[which(failed==i)]
+        }
+
+    # update the 'failed' vector: check again if there's still any entries with no result vector
+    failed <- which(unlist(lapply(1:length(marker.genes.expr.bg), function(x) length(marker.genes.expr.bg[x][[1]]))) == 0)    
+    message(paste0("Remaining failed cells: ", length(failed)))
+}
+
+# check again, if there are any empty results still
+table(unlist(lapply(1:length(marker.genes.expr.bg), function(x) length(marker.genes.expr.bg[x][[1]]))) == 0)
+# all F; great
+
+# as this returns a list: now need to coerce to a matrix
+marker.genes.expr.bg <- do.call(cbind, marker.genes.expr.bg)
+# add in colnames:
+colnames(marker.genes.expr.bg) <- colnames(mat.gx.filt.2)
+
+# now for each signature, can calculate the activation score, as described above:
+# for each signature gene subtract this calculated background expression 
+#
+# extract the per-cell expression values for the genes:
+mat.gx.marker.genes <- mat.gx.filt.2[ match( list.goi.sigs$gene, rownames(mat.gx.filt.2)), match(colnames(marker.genes.expr.bg),colnames(mat.gx.filt.2)) ]
+
+# are the two matrices the same dimensions?
+dim(marker.genes.expr.bg) == dim(mat.gx.marker.genes)
+# both TRUE
+#
+# yes: then can just subtract the background from the foreground:
+mat.gx.marker.genes <- mat.gx.marker.genes - marker.genes.expr.bg
+
+# then calculate average of the signature gene expression as the score, for each sig
+# construct df: strings aren't factors, for rownames get from input cols
+marker.scores <- data.frame(
+  astrocyte=colMeans( mat.gx.marker.genes[ match( list.goi.sigs$gene[list.goi.sigs$Celltype=="ast"], rownames(mat.gx.marker.genes)), ], na.rm=T ),
+  endothelium=colMeans( mat.gx.marker.genes[ match( list.goi.sigs$gene[list.goi.sigs$Celltype=="end"], rownames(mat.gx.marker.genes)), ], na.rm=T ),
+  microglia=colMeans( mat.gx.marker.genes[ match( list.goi.sigs$gene[list.goi.sigs$Celltype=="mic"], rownames(mat.gx.marker.genes)), ], na.rm=T ),
+  neuron=colMeans( mat.gx.marker.genes[ match( list.goi.sigs$gene[list.goi.sigs$Celltype=="neu"], rownames(mat.gx.marker.genes)), ], na.rm=T ),
+  oligodendrocyte=colMeans( mat.gx.marker.genes[ match( list.goi.sigs$gene[list.goi.sigs$Celltype=="oli"], rownames(mat.gx.marker.genes)), ], na.rm=T ),
+  stringsAsFactors=F, row.names=colnames(mat.gx.marker.genes)   
+)
+
+# calculate thresholds to binarise cells based on expression or not of the signature:
+# as in pub: median + 1.5x MAD
+#marker.scores.thresholds <- sapply(X=1:ncol(marker.scores), function(x) median(marker.scores[,x]) + 1.5*mad(marker.scores[,x]) )
+
+# add in pseudotime state by matching rownames (cell IDs):
+marker.scores$State <- pData(dCellData)$State[ match(rownames(marker.scores), rownames(pData(dCellData))) ]
+
+# use reshape2::melt to get the marker scores into a ggplot2-friendly format
+marker.scores <- reshape2::melt(marker.scores)
+colnames(marker.scores) <- c("State","Cell type", "Score") # fix colnames
+        
+# plot as beeswarm plots:
+#
+# generate outputname 
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_12_pseudotime_states_NBr_CellTypes_beeswarm.pdf" )
+pdf(outputname, height=6, width=2)
+# for data pass marker.scores df
+# split by pseudotime State on x
+# plot per-cell signature score on y
+# colour dots by State
+# use quasirandom geom from ggbeeswarm
+# facet by the different cell type signatures, with free y-axis scales
+# remove legend
+# add summary statistic: a single point showing median
+ggplot(data=marker.scores, aes(x=State, y=Score, colour=State)) + 
+           geom_quasirandom(size=0.5) + facet_grid(`Cell type` ~ ., scales="free") +
+           theme_bw() + xlab(NULL) + ylab("signature score") +
+           theme(legend.position="none") +
+           stat_summary(fun.y="median", geom="point", shape=23, fill="white") +
+           scale_colour_manual(values=state.colours)
+dev.off()
+
+# hmm, should make the same plot for the tumour sigs right:
+# generate df, get names from one of the input vectors
+subtype.scores <- data.frame(
+  MES=subtype.scores.mes,
+  RTK_I=subtype.scores.rtki,
+  RTK_II=subtype.scores.rtkii,  
+  stringsAsFactors=F, row.names=names(subtype.scores.mes)   
+)
+# add in pseudotime state by matching rownames (cell IDs):
+subtype.scores$State <- pData(dCellData)$State[ match(rownames(subtype.scores), rownames(pData(dCellData))) ]
+
+# use reshape2::melt to get the marker scores into a ggplot2-friendly format
+subtype.scores <- reshape2::melt(subtype.scores)
+colnames(subtype.scores) <- c("State","Subtype", "Score") # fix colnames
+
+# plot as beeswarm plots:
+# need to plot separately, unfortunately, as can't facet grid + also define y-lims for each facet simply...
+# generate outputname 
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_12_pseudotime_states_GB_Subtypes_beeswarm.pdf" )
+pdf(outputname, height=2, width=2)
+for(subtype in unique(subtype.scores$Subtype) )
+{
+    # manually define ylims:
+    if(subtype=="MES")
+    {
+        ylims <- c(0,0.03)
+    } else if(subtype=="RTK_I") {
+        ylims <- c(0,0.0075)
+    } else if(subtype=="RTK_II") {
+        ylims <- c(0,0.02)
+    }
+
+# print in a for() loop!
+#    
+# for data pass marker.scores df
+# split by pseudotime State on x
+# plot per-cell signature score on y
+# colour dots by State
+# use quasirandom geom from ggbeeswarm
+# facet by the different cell type signatures, with free y-axis scales
+# remove legend
+# add summary statistic: a single point showing median
+print( ggplot(data=subtype.scores[subtype.scores$Subtype==subtype,], aes(x=State, y=Score, colour=State)) + 
+           geom_quasirandom(size=0.5) + 
+           theme_bw() + xlab(NULL) + ylab("signature score") +
+           theme(legend.position="none") + ggtitle(subtype) +
+           stat_summary(fun.y="median", geom="point", shape=23, fill="white") + ylim(ylims) )  +
+           scale_colour_manual(values=state.colours)
+}
+# close plotting device
+dev.off()
+
+############################################################
+# do more plots of gene expression
+############################################################
+#
+# define set of genes of interest based on prior knowledge/literature...
+# 
+# use population markers defined in recent metanalysis paper
+# https://www.nature.com/articles/s41598-018-27293-5#Sec21
+# read in table:
+list.goi <- read.csv("./McKenzie_normal_brain_cell_markers_topHumEnrich.csv", stringsAsFactors=F)
+# filter for genes not in the expr mat:
+list.goi <- list.goi[ list.goi$gene %in% rownames(mat.gx.filt.2), ]
+
+# take top 20 for each celltype
+# cell types are: ast, end, mic, neu, oli
+list.goi <- rbind(
+    list.goi[list.goi$Celltype=="ast",][1:20,],
+    list.goi[list.goi$Celltype=="end",][1:20,],
+    list.goi[list.goi$Celltype=="mic",][1:20,],
+    list.goi[list.goi$Celltype=="neu",][1:20,],
+    list.goi[list.goi$Celltype=="oli",][1:20,]
+)
+
+# now also overlap with list of genes of interest and MRs in this analysis:
+list.goi <- union( list.goi$gene, keep.mrs.viper,
+			c("EGFR","SOX9", # GB markers from Darmanis
+            "SOX10","NR0B1","MYT1", "GPR17","PDGFRA","ERBB3","HDAC2","DLL3","SOX8","PLP1","SOX11","CSPG4", "BRD4", # RTK_I markers
+            "FOSL1","RUNX2","CCL2","MITF","FOSL2", "SERPINE1","CD44","TGFBR2","ITGA5","POSTN","TGFBI", # MES markers
+            "GLI2","POU3F2","NR2E1", "MEOX2","SOCS2","JUND","IRF3","TEAD3", "SOX9", "CREB3L2", # RTK_II markers
+            "SALL4", "POU5F1", "SOX2", "STAT3", "NANOG", "MYC", "KLF4", "PROM1", "NES", "GFAP", # GSC/NSC markers
+			"CHD7", "CHD8", "OLIG1","OLIG2", "ASCL1", # oligodendrocyte lineage/related genes
+            "AIF1","ITGAM","PTPRC") ) # microglial markers		
+			
+# re-extract VST expr matrix from the dCellData object
+mat.gx.filt.2 <- vstExprs(dCellData)			
+			
+# plot:
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_08_pseudotime_markerGenes.pdf" )
+pdf(outputname, height=6, width=6)
+for( g in list.goi ) 
+{
+    message(g)
+    # add to phenodata to plot
+    pData(dCellData)$GOI <- mat.gx.filt.2[g,]
+
+    # print inside a for() loop
+    # plot_cell_trajectory returns a ggplot obj!
+    # colour by GOI expr, smaller point size
+    # so add a title and rug geoms
+	# manually pass the viridis color scale (monocle doesn't play nice!)
+    print(plot_cell_trajectory(dCellData, color_by="GOI", cell_size=0.75) + 
+          ggtitle(g) + geom_rug(aes(colour=GOI)) +
+		  scale_colour_viridis_c(option="D", breaks=c( min(pData(dCellData)[,"GOI"]), 0, max(pData(dCellData)[,"GOI"])) )
+		  )
+}
+dev.off()
+#
+# lovely!
+#
+##############################
+#
+# additionally: plot the same as beeswarm plots.
+#
+##############################
+outputname <- paste0( Sys.Date(), "_monocle_analysis_allCells_08_pseudotime_markerGenes_bees.pdf" )
+pdf(outputname, height=2, width=6)
+for( g in list.goi[list.goi %in% rownames(mat.gx.filt.2)] ) 
+{
+    message(g)
+    # add to phenodata to plot
+    pData(dCellData)$GOI <- mat.gx.filt.2[g,]
+
+    # print inside a for() loop
+    # pass phenodata for monocle obj as input dataframe
+    # split by pseudotime State on x
+    # plot GOI expression on y
+    # colour violins by State
+    # use quasirandom geom from ggbeeswarm
+    # title = gene name, b/w theme, change x/y axis labs
+    # remove legend
+	# use pseudotime state colours 
+    print( ggplot(data=pData(dCellData), aes(x=State, y=GOI, colour=State)) + 
+           geom_quasirandom(size=0.5) +
+           ggtitle(g) + theme_bw() + xlab(NULL) + ylab("expression (VST)") +
+           theme(legend.position="none") + scale_colour_manual(values=state.colours)
+         )
+}
+dev.off()
+
+############################################################
+############################################################
+#
+#
+# SAVE COPY OF SESSION INFO AND R ENVIRONMENT
+#
+#
+############################################################
+############################################################
+# session info
+seshinf <- paste ( Sys.Date(), "_scRNAseq_Darmanis_analysis_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)
+
+# Renv
+outputname <- paste( Sys.Date(), "_scRNAseq_Darmanis_analysis_end_Renv.Rdata", sep="")
+save.image(file=outputname)

@@ -1,0 +1,148 @@
+#!/bin/R
+
+####### code to produce Volcano plots of ATAC diffbound peak HOMER motifs
+#
+# code from 20191108
+
+# b06x-cnt2
+# screen name: chip
+
+# request interactive session - small!
+# qsub -I -l walltime=2:00:00,mem=8g,nodes=1
+# load R v3.4.3: module load R-bundle/20171215-foss-2017a-R-3.4.3
+
+#############################################
+#
+# setup
+#
+#############################################
+# define #cores to parallelise over; set based on #cores requested for job
+n.cores <- 1
+
+# load libs for analysis:
+suppressMessages(library(viridis))
+# load Epik 
+#suppressMessages( library(epik) )
+# for differential binding analysis
+#suppressMessages( library(DiffBind) )
+# to install if needed:
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("EnsDb.Hsapiens.v75")
+#
+# annotation libs:
+#suppressMessages( library(EnsDb.Hsapiens.v75) )
+#suppressMessages( library(TxDb.Hsapiens.UCSC.hg19.knownGene) )
+suppressMessages( library(ggplot2) )
+suppressMessages( library(org.Hs.eg.db) )
+suppressMessages( library(reactome.db) )
+# ChIP analysis:
+suppressMessages( library(ChIPpeakAnno) )
+#library(DiffBind)
+# plotting and heatmaps
+suppressMessages( library(RColorBrewer) )
+suppressMessages( library(EnrichedHeatmap) )
+suppressMessages( library(circlize) )
+# parallelise some data loading functions
+#suppressMessages( library(parallel) )
+# RTN
+#suppressMessages(library(RTN))
+
+# load common HIPO016 analysis code...
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+# set working dir
+dir.working <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/chipseq_sox10_kd/"
+setwd(dir.working)
+
+#############################################
+#
+# now: input files are the knownResults.txt tab-delim tables output by homer for known motifs
+# in subdirs as above, e.g.
+#        20191108_HOMER_results_ZH487_ATAC_diff_bound_for_Volcano_plot_fg_NT
+#
+# so we need to treat each cell line separately, as follows:
+#     1. load the two 
+#     2. check that the fold changes are reciprocal
+#     3. then take the calculated pvals based on the sign of fold change
+# 
+# try plotting that.
+#
+#############################################
+# load the tables for the 4 ATAC diffbound peaksets (LN and ZH, up and down)
+#
+# construct paths based on working dir:
+path.input.files <- paste0(
+list.files()[grepl(pattern=glob2rx("20191108_HOMER_results_*_ATAC_diff_bound_for_Volcano_plot*"), x=list.files())],
+    "/knownResults.txt"
+)
+
+# read in:
+list.res.motifs <- lapply(X=path.input.files, FUN=read.table, sep="\t", header=T, quote="", comment.char="",
+                         stringsAsFactors=F, 
+                         col.names=c("motif.name","motif.consensus","pval","log.pval","qval",
+                                     "n.target", "pc.target", "n.background", "pc.background")
+                         )
+
+# add names based on input files (hardcoded!)
+names(list.res.motifs) <- c("LN229_fg_NT","LN229_fg_shSOX10","ZH487_fg_NT","ZH487_fg_shSOX10")
+
+# fix cols with trailing % -> numeric
+list.res.motifs$LN229_fg_NT$pc.background <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$LN229_fg_NT$pc.background))
+list.res.motifs$LN229_fg_NT$pc.target <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$LN229_fg_NT$pc.target))
+list.res.motifs$ZH487_fg_NT$pc.background <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$ZH487_fg_NT$pc.background))
+list.res.motifs$ZH487_fg_NT$pc.target <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$ZH487_fg_NT$pc.target))
+list.res.motifs$LN229_fg_shSOX10$pc.background <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$LN229_fg_shSOX10$pc.background))
+list.res.motifs$LN229_fg_shSOX10$pc.target <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$LN229_fg_shSOX10$pc.target))
+list.res.motifs$ZH487_fg_shSOX10$pc.background <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$ZH487_fg_shSOX10$pc.background))
+list.res.motifs$ZH487_fg_shSOX10$pc.target <- as.numeric(sub(pattern="%",replacement="",x=list.res.motifs$ZH487_fg_shSOX10$pc.target))
+
+# now: want to add a simplified motif name and fold change
+#
+# example:  Foxo3(Forkhead)/U2OS-Foxo3-ChIP-Seq(E-MTAB-2701)/Homer
+# so take just the first field separated by /s
+list.res.motifs <- lapply(X=list.res.motifs, FUN=function(t)
+                          data.frame( t, 
+                                 motif.name.short=sapply(X=strsplit(x=t$motif.name, split="/"), "[", 1),
+                                 fold.change=t$pc.target-t$pc.background,
+                                 minus.log.pval=-(t$log.pval)    
+                               )                          
+                         )
+
+# reorder by motif
+list.res.motifs <- lapply(X=list.res.motifs, FUN=function(t)
+                             t[ order(t$motif.name.short), ]                  
+                         )
+
+# now generate dfs for ggplot2 and plot:
+# 
+# as dfs are in same order (motif.name.short) can:
+#
+#  1. for fold changes, take the mean (as these are v. close but have different signs)
+#  2. for the -log.pvals take the max (as this will be the "enrichment" pval out of the two pvals on offer)
+#
+#
+# LN229
+plot.mat.ln <- data.frame(
+  motif=list.res.motifs$LN229_fg_NT$motif.name.short,
+  fold.change=rowMeans( cbind(list.res.motifs$LN229_fg_NT$fold.change, -(list.res.motifs$LN229_fg_shSOX10$fold.change)) ),
+  log10.pval=rowMax( cbind( list.res.motifs$LN229_fg_NT$minus.log.pval, list.res.motifs$LN229_fg_shSOX10$minus.log.pval ) ) 
+)
+# output:
+pdf(paste0(Sys.Date(), "_HOMER_LN229_diff_bound_ATAC_Volcano.pdf"))
+ggplot(data=plot.mat.ln, aes(x=fold.change, y=log10.pval, label=motif)) + geom_point() + geom_text() +
+theme_bw() +
+ggtitle("LN229") + xlab("Motif fold change in NT-shSOX10") + ylab("-log10(unadj. p-value)") 
+dev.off()
+#
+# ZH487
+plot.mat.zh <- data.frame(
+  motif=list.res.motifs$ZH487_fg_NT$motif.name.short,
+  fold.change=rowMeans( cbind(list.res.motifs$ZH487_fg_NT$fold.change, -(list.res.motifs$ZH487_fg_shSOX10$fold.change)) ),
+  log10.pval=rowMax( cbind( list.res.motifs$ZH487_fg_NT$minus.log.pval, list.res.motifs$ZH487_fg_shSOX10$minus.log.pval ) ) 
+)
+# output:
+pdf(paste0(Sys.Date(), "_HOMER_ZH487_diff_bound_ATAC_Volcano.pdf"))
+ggplot(data=plot.mat.zh, aes(x=fold.change, y=log10.pval, label=motif)) + geom_point() + geom_text() +
+theme_bw() +
+ggtitle("ZH487") + xlab("Motif fold change in NT-shSOX10") + ylab("-log10(unadj. p-value)") 
+dev.off()

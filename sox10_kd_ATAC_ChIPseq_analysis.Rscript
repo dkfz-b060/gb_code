@@ -1,0 +1,1015 @@
+#!/bin/R
+
+###### code to produce figures for ATAC/ChIPseq analysis
+#
+# code from ipynb 20190507
+
+
+# b06x-cnt2
+# screen name: chip
+
+# request interactive session - 8 cpus!
+# qsub -I -l walltime=24:00:00,mem=64g,nodes=1:ppn=8
+# load R v3.4.3: module load R-bundle/20171215-foss-2017a-R-3.4.3
+# also load kentUtils for bigWigAverageOverBed: module load kentUtils
+
+#############################################
+#
+# setup
+#
+#############################################
+# define #cores to parallelise over; set based on #cores requested for job
+n.cores <- 8
+
+# load libs for analysis:
+# load Epik 
+suppressMessages( library(epik) )
+# for differential binding analysis
+suppressMessages( library(DiffBind) )
+# to install if needed:
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("EnsDb.Hsapiens.v75")
+#
+# annotation libs:
+suppressMessages( library(EnsDb.Hsapiens.v75) )
+suppressMessages( library(TxDb.Hsapiens.UCSC.hg19.knownGene) )
+suppressMessages( library(ggplot2) )
+suppressMessages( library(org.Hs.eg.db) )
+suppressMessages( library(reactome.db) )
+# ChIP analysis:
+suppressMessages( library(ChIPpeakAnno) )
+#library(DiffBind)
+# plotting and heatmaps
+suppressMessages( library(RColorBrewer) )
+suppressMessages( library(EnrichedHeatmap) )
+suppressMessages( library(circlize) )
+# parallelise some data loading functions
+suppressMessages( library(parallel) )
+
+# load common HIPO016 analysis code...
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+# set working dir
+dir.working <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/chipseq_sox10_kd/"
+setwd(dir.working)
+
+# function to take an arbitrary GR, output a bedfile that can be used for HOMER motif finding:
+# args: gr = input GRanges; peaksetName = character string to use as peak IDs; outputname = output file name
+output.bed <- function(gr, peaksetName="PeakID", outputname)
+{
+    df.out <- as.data.frame(gr)[,c(1:3)]
+    df.out[,4] <- paste0( peaksetName, "_", 1:nrow(df.out) ) # 4th col = region ID
+    df.out[,5] <- 0 # set 5th col = strand to 0
+    write.table( x=df.out, file=outputname, sep="\t", quote=F, col.names=F, row.names=F )
+}
+
+# load gencode v19 ref as GR
+load(path.gencode) # load gencode ref GR
+gencode <- gencode[gencode$type=="gene"] # filter for genes only
+
+###############
+# locations of data:
+###############
+# find input files for ChIPpeakAnno:
+# want the narrowPeak macs2 peak calls (as these are point sources...)
+# define input dir to search in: carl's data dir; return vector of the results of the command.
+dir.data <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/user_folder/herrmanc/data/"
+paths.input.peaks <- system2("find", args=paste0( dir.data, " -name *.narrowPeak"), stdout=TRUE )
+#
+# note!!: ZH487 ATACseq calls are in here already
+
+# get the LN229 ATACseq data also: +/- DOX (i.e. NT vs shSOX10), 2 reps each.
+# directory: /icgc/dkfzlsdf/analysis/hipo/hipo_016/yonghe/old/
+dir.atac <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/yonghe/old/"
+# filenames: LN229_con1_peaks.narrowPeak and con2; LN229_DOX1_peaks.narrowPeak and DOX2 
+paths.input.atac <- system2("find", args=paste0( dir.atac, " -name LN229_????_peaks.narrowPeak"), stdout=TRUE)
+# also hit 4 further files in the /sox10/ subdir; so remove those and then concatenate with input peaks vector
+paths.input.atac <- paths.input.atac[!grepl(pattern="/sox10/", x=paths.input.atac)]
+
+# concatenate all input peaks vectors together:
+paths.input.peaks <- c(paths.input.peaks, paths.input.atac)
+
+# use lapply + toGRanges to read these files in; use format=narrowPeak, cos they are MACS2 narrowPeak files.
+# read in; split by cell line:
+peaks.ln <- lapply(X=paths.input.peaks[grepl(pattern="LN229",x=paths.input.peaks)], FUN=toGRanges, format="narrowPeak")
+peaks.zh <- lapply(X=paths.input.peaks[grepl(pattern="ZH487",x=paths.input.peaks)], FUN=toGRanges, format="narrowPeak")
+# add names manually:
+names(peaks.ln) <- c("shSOX10_SOX10", "NT_SOX10", "shSOX10_BRD4", "NT_BRD4", "NT_ATAC_1", 
+                     "shSOX10_ATAC_1", "shSOX10_ATAC_2", "NT_ATAC_2")
+names(peaks.zh) <- c("NT_SOX10", "shSOX10_SOX10", "NT_ATAC_1", "NT_ATAC_2",
+                     "shSOX10_ATAC_1", "shSOX10_ATAC_2", "NT_BRD4", "shSOX10_BRD4")
+
+#############################################
+#
+# generate consensus peaksets from the ATACseq replicates
+#
+#############################################
+# for LN229 first:
+########
+# first plot overlaps of the two conditions' replicates separately
+# NT:
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_LN229_ATAC_replicates_NT.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram(peaks.ln[c("NT_ATAC_1", "NT_ATAC_2")], NameOfPeaks=c("ATAC rep1","ATAC rep2"))
+dev.off()
+
+# shSOX10:
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_LN229_ATAC_replicates_shSOX10.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram(peaks.ln[c("shSOX10_ATAC_1", "shSOX10_ATAC_2")], NameOfPeaks=c("ATAC rep1","ATAC rep2"))
+dev.off()
+# so that shows EXCELLENT overlap; as consensus peakset, take those in both, i guess
+#
+# so find overlaps for each condition
+peaks.ln.atac.nt <- findOverlapsOfPeaks(peaks.ln[c("NT_ATAC_1", "NT_ATAC_2")])
+peaks.ln.atac.sh <- findOverlapsOfPeaks(peaks.ln[c("shSOX10_ATAC_1", "shSOX10_ATAC_2")])
+#
+# and then remove the replicates in the LN229 peaks GRlist, replace with the consensus from above:
+peaks.ln <- peaks.ln[ !(names(peaks.ln) %in% c("NT_ATAC_1", "NT_ATAC_2", "shSOX10_ATAC_1", "shSOX10_ATAC_2")) ]
+peaks.ln$NT_ATAC <- peaks.ln.atac.nt$mergedPeaks
+peaks.ln$shSOX10_ATAC <- peaks.ln.atac.sh$mergedPeaks
+
+# write these as bed also:
+# need to do this manually cos rtracklayer outputs MALFORMED FILES, for fuck's sake
+# so shuffle the output cols and write to tab-delim text without row/colnames or quotes:
+# add in a new peakname for the 4th col; fix strand in last/5th col
+# 
+# NT
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_consensus_peaks_NT.bed" )
+output.bed(gr=peaks.ln$NT_ATAC, peaksetName="LN229_ATAC_NT", outputname=outputname)
+# shSOX10
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_consensus_peaks_shSOX10.bed" )
+output.bed(gr=peaks.ln$shSOX10_ATAC, peaksetName="LN229_ATAC_shSOX10", outputname=outputname)
+
+########
+# for ZH487:
+########
+# first plot overlaps of the two conditions' replicates separately
+# NT:
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ZH487_ATAC_replicates_NT.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram(peaks.zh[c("NT_ATAC_1", "NT_ATAC_2")], NameOfPeaks=c("ATAC rep1","ATAC rep2"))
+dev.off()
+
+# shSOX10:
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ZH487_ATAC_replicates_shSOX10.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram(peaks.zh[c("shSOX10_ATAC_1", "shSOX10_ATAC_2")], NameOfPeaks=c("ATAC rep1","ATAC rep2"))
+dev.off()
+# so that shows EXCELLENT overlap; as consensus peakset, take those in both, i guess
+#
+# so find overlaps for each condition
+peaks.zh.atac.nt <- findOverlapsOfPeaks(peaks.zh[c("NT_ATAC_1", "NT_ATAC_2")])
+peaks.zh.atac.sh <- findOverlapsOfPeaks(peaks.zh[c("shSOX10_ATAC_1", "shSOX10_ATAC_2")])
+#
+# and then remove the replicates in the ZH487 peaks GRlist, replace with the consensus from above:
+peaks.zh <- peaks.zh[ !(names(peaks.zh) %in% c("NT_ATAC_1", "NT_ATAC_2", "shSOX10_ATAC_1", "shSOX10_ATAC_2")) ]
+peaks.zh$NT_ATAC <- peaks.zh.atac.nt$mergedPeaks
+peaks.zh$shSOX10_ATAC <- peaks.zh.atac.sh$mergedPeaks
+
+# write these as bed also:
+# need to do this manually cos rtracklayer outputs MALFORMED FILES, for fuck's sake
+# so shuffle the output cols and write to tab-delim text without row/colnames or quotes:
+# add in a new peakname for the 4th col; fix strand in last/5th col
+# 
+# NT
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_consensus_peaks_NT.bed" )
+output.bed(gr=peaks.zh$NT_ATAC, peaksetName="ZH487_ATAC_NT", outputname=outputname)
+# shSOX10
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_consensus_peaks_shSOX10.bed" )
+output.bed(gr=peaks.zh$shSOX10_ATAC, peaksetName="ZH487_ATAC_shSOX10", outputname=outputname)
+
+
+#############################################
+#
+# calculate Venn diagrams of overlaps between pairs of peaksets
+#
+#############################################
+# overlap SOX10, in NT, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_SOX10_NT_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.ln[["NT_SOX10"]], peaks.zh[["NT_SOX10"]]), # peaksets to plot
+                NameOfPeaks=c("LN229", "ZH487"), fill=c("darkgreen","darkgreen"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 ) # increase label font sizes (depends on output plot device size!)
+dev.off()
+# overlap BRD4, in NT, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_BRD4_NT_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.ln[["NT_BRD4"]], peaks.zh[["NT_BRD4"]]), # peaksets to plot
+                NameOfPeaks=c("LN229", "ZH487"), fill=c("darkblue","darkblue"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 ) # increase label font sizes (depends on output plot device size!)
+dev.off()
+# overlap BRD4, in shSOX10, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_BRD4_shSOX10_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.ln[["shSOX10_BRD4"]], peaks.zh[["shSOX10_BRD4"]]), # peaksets to plot
+                NameOfPeaks=c("LN229", "ZH487"), fill=c("darkblue","darkblue"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 ) # increase label font sizes (depends on output plot device size!)
+dev.off()
+# overlap SOX10 + BRD4, separately in the two cell lines
+# LN229
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_SOX10-BRD4_NT_peaks_LN229.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.ln[["NT_SOX10"]], peaks.ln[["NT_BRD4"]]), # peaksets to plot
+                NameOfPeaks=c("SOX10", "BRD4"), fill=c("darkgreen","darkblue"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 ) # increase label font sizes (depends on output plot device size!)
+dev.off()
+# ZH487
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_SOX10-BRD4_NT_peaks_ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.zh[["NT_SOX10"]], peaks.zh[["NT_BRD4"]]), # peaksets to plot
+                NameOfPeaks=c("SOX10", "BRD4"), fill=c("darkgreen","darkblue"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 ) # increase label font sizes (depends on output plot device size!)
+dev.off()
+#
+# 4-way overlap of SOX10+BRD4, in NT, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_SOX10-BRD4_NT_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.ln[["NT_BRD4"]], peaks.zh[["NT_BRD4"]],
+                             peaks.ln[["NT_SOX10"]], peaks.zh[["NT_SOX10"]] ), # peaksets to plot
+                NameOfPeaks=c("LN229 BRD4", "ZH487 BRD4", "LN229 SOX10", "ZH487 SOX10"),
+                fill=c("darkblue","darkblue","darkgreen","darkgreen"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 )
+                
+dev.off()
+
+# overlap ATAC in LN229, NT vs SH
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ATAC_peaks_LN229.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( peaks.ln[c("NT_ATAC","shSOX10_ATAC")], 
+                NameOfPeaks=c("NT","shSOX10"),
+                fill=c("grey","grey"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 )
+dev.off()
+# overlap ATAC in ZH487, NT vs SH
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ATAC_peaks_ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( peaks.zh[c("NT_ATAC","shSOX10_ATAC")], 
+                NameOfPeaks=c("NT","shSOX10"),
+                fill=c("grey","grey"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 )
+dev.off()
+# overlap ATAC, in NT, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ATAC_NT_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.ln[["NT_ATAC"]], peaks.zh[["NT_ATAC"]]), # peaksets to plot
+                NameOfPeaks=c("LN229", "ZH487"), fill=c("grey","grey"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 ) # increase label font sizes (depends on output plot device size!)
+dev.off()
+# overlap ATAC, in shSOX10, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ATAC_shSOX10_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+makeVennDiagram( GRangesList(peaks.ln[["shSOX10_ATAC"]], peaks.zh[["shSOX10_ATAC"]]), # peaksets to plot
+                NameOfPeaks=c("LN229", "ZH487"), fill=c("grey","grey"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 ) # increase label font sizes (depends on output plot device size!)
+dev.off()
+
+# 4-way overlap of ATAC+SOX10, in NT, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ATAC-SOX10_NT_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+# use list() instead of GRangesList() here because diff mcols throw an error
+makeVennDiagram( list(peaks.ln[["NT_ATAC"]], peaks.zh[["NT_ATAC"]],
+                             peaks.ln[["NT_SOX10"]], peaks.zh[["NT_SOX10"]] ), # peaksets to plot
+                NameOfPeaks=c("LN229 ATAC", "ZH487 ATAC", "LN229 SOX10", "ZH487 SOX10"),
+                fill=c("grey","grey","darkgreen","darkgreen"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 )
+dev.off()
+# 4-way overlap of ATAC+BRD4, in NT, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ATAC-BRD4_NT_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+# use list() instead of GRangesList() here because diff mcols throw an error
+makeVennDiagram( list(peaks.ln[["NT_ATAC"]], peaks.zh[["NT_ATAC"]],
+                             peaks.ln[["NT_BRD4"]], peaks.zh[["NT_BRD4"]] ), # peaksets to plot
+                NameOfPeaks=c("LN229 ATAC", "ZH487 ATAC", "LN229 BRD4", "ZH487 BRD4"),
+                fill=c("grey","grey","darkblue","darkblue"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 )
+dev.off()
+
+# 4-way overlap of ATAC+BRD4, in shSOX10, in the two cell lines
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_01_overlap_ATAC-BRD4_shSOX10_peaks_LN229-ZH487.pdf")
+pdf(outputname, height=6, width=6)
+# use list() instead of GRangesList() here because diff mcols throw an error
+makeVennDiagram( list(peaks.ln[["shSOX10_ATAC"]], peaks.zh[["shSOX10_ATAC"]],
+                             peaks.ln[["shSOX10_BRD4"]], peaks.zh[["shSOX10_BRD4"]] ), # peaksets to plot
+                NameOfPeaks=c("LN229 ATAC", "ZH487 ATAC", "LN229 BRD4", "ZH487 BRD4"),
+                fill=c("grey","grey","darkblue","darkblue"), # peakset names + colours for venn
+                main.fontfamily="sans", cat.fontfamily="sans", fontfamily="sans", # define font style for plot
+                cex=1.4, cat.cex=1 )
+dev.off()
+
+###############
+# assign the shared SOX10 peaks to a chromosome region, based on TxDb annotation
+# output a barplot
+###############
+# use UCSC known genes for TxDb, loaded above
+#
+# find overlaps:
+peaks.sox.shared <- findOverlapsOfPeaks(peaks.ln[["NT_SOX10"]], peaks.zh[["NT_SOX10"]])
+# then extract those overlapping regions + annotate  with genic locations:
+chromreg <- assignChromosomeRegion(peaks.sox.shared$mergedPeaks, nucleotideLevel=F,
+                             precedence=c("Promoters", "immediateDownstream", 
+                                           "fiveUTRs", "threeUTRs", 
+                                           "Exons", "Introns"), 
+                             TxDb=TxDb.Hsapiens.UCSC.hg19.knownGene)
+# coerce to a ggplot2 df
+df.chromreg <- data.frame( region=names(chromreg$percentage), percentage=as.numeric(chromreg$percentage) )
+# then plot:
+p <- ggplot(data=df.chromreg, aes(x=region, y=percentage)) + geom_bar(stat="identity") + 
+     theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1)) + xlab(NULL)
+outputname <- paste0(Sys.Date(), "_SOX10_ChIPseq_02_peak_by_chromosome_regions.pdf")
+pdf(outputname, height=4, width=4)
+p
+dev.off()
+
+###############
+# prep annotation for peak anno: use Ensembl v75 (!) genes (corresponds to hg19 + our gencode)
+###############
+# create annotation obj from EnsDb:
+annoData <- toGRanges(EnsDb.Hsapiens.v75, feature="gene")
+
+###############
+# annotate peaks with additional information
+###############
+# do for LN229
+peaks.ln.anno <- mclapply(X=peaks.ln, FUN=annotatePeakInBatch,
+         # options for annotatePeakInBatch
+         AnnotationData=annoData, # use Ensembl v79
+         output="nearestLocation",
+         bindingRegion=c(-2000, 2000), # promoter region definition
+         mc.cores=n.cores)
+# add ENSEMBL gene IDs also
+peaks.ln.anno <- lapply(X=peaks.ln.anno, FUN=addGeneIDs, orgAnn="org.Hs.eg.db", IDs2Add = "ENSEMBL")
+#
+# do for ZH487
+peaks.zh.anno <- mclapply(X=peaks.zh, FUN=annotatePeakInBatch,
+         # options for annotatePeakInBatch
+         AnnotationData=annoData, # use Ensembl v79
+         output="nearestLocation",
+         bindingRegion=c(-2000, 2000), # promoter region definition
+         mc.cores=n.cores)
+# add ENSEMBL gene IDs also
+peaks.zh.anno <- lapply(X=peaks.zh.anno, FUN=addGeneIDs, orgAnn="org.Hs.eg.db", IDs2Add = "ENSEMBL")
+
+# write each table to text: loop over each peaklist; do for both cell lines
+for( name in names(peaks.ln.anno) )
+{
+  outputname <- paste0( Sys.Date(), "_LN229_", name, "_peaks_annotated.csv")
+  write.csv(file=outputname, x=peaks.ln.anno[[name]])  
+}
+for( name in names(peaks.zh.anno) )
+{
+  outputname <- paste0( Sys.Date(), "_ZH487_", name, "_peaks_annotated.csv")
+  write.csv(file=outputname, x=peaks.zh.anno[[name]])  
+}
+
+##############################
+# do GO testing for selected peaksets:
+#
+# (a) shared SOX10 peaks in LN229+ZH487, NT
+# (b) shared BRD4 peaks in LN229+ZH487, NT
+# (c) 4-way overlap of LN229+ZH487 SOX10+BRD4, NT
+# (d) LN229 ATAC: NT only, shSOX10 only, shared peaks
+# (e) SOX10, BRD4 peaks in the NT and shSOX10 conditions in LN229+ZH487 also.
+# (f) ZH487 ATAC: NT only, shSOX10 only, shared peaks
+#
+##############################
+# also output these peaksets as bed for HOMER motif finding
+##############################
+# set up a GRList of these peaksets, with meaningful names!
+#
+# first need to generate the overlaps:
+# calculate for the ATAC once as will extract 3 times
+atac.ln.olaps <- findOverlapsOfPeaks( peaks.ln[["NT_ATAC"]], peaks.ln[["shSOX10_ATAC"]] )
+atac.zh.olaps <- findOverlapsOfPeaks( peaks.zh[["NT_ATAC"]], peaks.zh[["shSOX10_ATAC"]] )
+# now make a list 
+peaks.testing <- GRangesList(
+  LN229_ZH487_NT_shared_SOX10=findOverlapsOfPeaks( peaks.ln[["NT_SOX10"]], peaks.zh[["NT_SOX10"]] )$mergedPeaks,
+  LN229_ZH487_NT_shared_BRD4=findOverlapsOfPeaks( peaks.ln[["NT_BRD4"]], peaks.zh[["NT_BRD4"]] )$mergedPeaks,
+  NT_4way_overlap=findOverlapsOfPeaks( peaks.ln[["NT_BRD4"]], peaks.ln[["NT_SOX10"]], peaks.zh[["NT_BRD4"]], peaks.zh[["NT_SOX10"]] )$mergedPeaks, 
+  LN229_ATAC_unique_NT=atac.ln.olaps$peaklist$`peaks.ln...NT_ATAC...`,
+  LN229_ATAC_unique_shSOX10=atac.ln.olaps$peaklist$`peaks.ln...shSOX10_ATAC...`,
+  LN229_ATAC_shared=atac.ln.olaps$mergedPeaks,
+  ZH487_ATAC_unique_NT=atac.zh.olaps$peaklist$`peaks.zh...NT_ATAC...`,
+  ZH487_ATAC_unique_shSOX10=atac.zh.olaps$peaklist$`peaks.zh...shSOX10_ATAC...`,
+  ZH487_ATAC_shared=atac.zh.olaps$mergedPeaks     
+)
+
+# output each of these peaksets as a bedfile, for HOMER motif finding:
+for( name in names(peaks.testing) )
+{
+    outputname <- paste0( Sys.Date(), "_", name, "_peaks_forHOMER.bed" )
+    output.bed(gr=peaks.testing[[name]], peaksetName=name, outputname=outputname)
+}    
+#
+#
+# next: annotate peaks with genes:
+peaks.testing.anno <- mclapply(X=peaks.testing, FUN=annotatePeakInBatch,
+         # options for annotatePeakInBatch
+         AnnotationData=annoData, # use Ensembl v79
+         output="nearestLocation",
+         bindingRegion=c(-2000, 2000), # promoter region definition
+         mc.cores=n.cores)
+# write to text
+for( name in names(peaks.testing.anno) )
+{
+    outputname <- paste0( Sys.Date(), "_", name, "_peaks_annotated_by_gene.csv" )
+    write.csv(x=as.data.frame(peaks.testing.anno[[name]]), file=outputname)
+}   
+
+###############
+# add in the single-factor samples also, before doing testing:
+###############
+peaks.testing.anno <- c(peaks.testing.anno, peaks.ln.anno, peaks.zh.anno)
+
+# fix the names here: need to add the cell line to the 10-15th (LN229) and 16th-21st (ZH487) names
+names(peaks.testing.anno)[10:15] <- paste0("LN229_", names(peaks.testing.anno)[10:15]) 
+names(peaks.testing.anno)[16:19] <- paste0("ZH487_", names(peaks.testing.anno)[16:21]) 
+
+###############
+# now do GO testing:
+###############
+# can't parallelise here
+peaks.testing.anno.go <- lapply(X=peaks.testing.anno, FUN=getEnrichedGO,
+                     orgAnn="org.Hs.eg.db", maxP=0.05, minGOterm=10, 
+                     multiAdjMethod="BH", condense=TRUE)
+# write BP, CC results to tables
+for( name in names(peaks.testing.anno.go) )
+{
+  outputname <- paste0( Sys.Date(), "_", name, "_peaks_GO_testing_BP.csv")
+  write.csv(file=outputname, x=peaks.testing.anno.go[[name]]$bp)  
+  outputname <- paste0( Sys.Date(), "_", name, "_peaks_GO_testing_CC.csv")
+  write.csv(file=outputname, x=peaks.testing.anno.go[[name]]$cc)  
+}
+#
+###############
+# do pathway (reactome DB) testing
+###############
+# can't parallelise here
+# relax pval threshold to 0.1
+peaks.testing.anno.pw <- lapply(X=peaks.testing.anno, FUN=getEnrichedPATH,
+                     orgAnn="org.Hs.eg.db", pathAnn="reactome.db", maxP=0.1, multiAdjMethod="BH"  )
+# now simplify results: have a row per gene hitting a pathway (!!); 
+# so take only the unique rows (without this gene ID, in the EntrezID column)
+peaks.testing.anno.pw <- lapply(X=peaks.testing.anno.pw, FUN=function(df)
+                          unique( subset(x=df, select= -EntrezID) ) )
+# flatten list of enriched pathways to a df
+peaks.testing.anno.pw <- do.call(rbind, peaks.testing.anno.pw)
+# get sample name from rownames
+peaks.testing.anno.pw$sample <- sapply(X=strsplit(rownames(peaks.testing.anno.pw), "[.]"), FUN="[", 1)
+
+# need to add pathway names by matching pathway IDs, to that column of the results df
+# get ID to name map as list
+path.map <- as.list(reactomePATHID2NAME)
+# for some reason there are fucking pathways NOT in this mapping list, but ARE in the db tested? sigh. so filter:
+peaks.testing.anno.pw <- peaks.testing.anno.pw[peaks.testing.anno.pw$path.id %in% names(path.map),]
+# now map:
+peaks.testing.anno.pw$PATH <- unlist(path.map[as.character(peaks.testing.anno.pw$path.id)])
+
+# write results to tables
+outputname <- paste0( Sys.Date(), "_all_peaksets_Reactome_testing.csv")
+write.csv(file=outputname, x=peaks.testing.anno.pw)
+
+#############################################
+# 
+# next: do DiffBind analysis on ATAC peaks
+# do for LN229 and ZH487 separately.
+#
+#############################################
+# run diffBind analysis
+###############
+# define samplesheet:
+path.samplesheet.dba.ln <- paste0(dir.working, "LN229_ATAC_DiffBind_samplesheet.csv")
+path.samplesheet.dba.zh <- paste0(dir.working, "ZH487_ATAC_DiffBind_samplesheet.csv")
+
+# generate DBA object based on samplesheet
+db.ln <- dba(sampleSheet=path.samplesheet.dba.ln)
+db.zh <- dba(sampleSheet=path.samplesheet.dba.zh)
+
+# load count data
+db.ln <- dba.count(db.ln)
+db.zh <- dba.count(db.zh)
+
+# establish experimental design contrasts
+db.ln <- dba.contrast(db.ln, categories=DBA_CONDITION, minMembers=2)
+db.zh <- dba.contrast(db.zh, categories=DBA_CONDITION, minMembers=2)
+# set minMembers = 2 because we only have dupes anyway
+
+# run analysis
+db.ln <- dba.analyze(db.ln)
+db.zh <- dba.analyze(db.zh)
+
+# output report
+db.ln.DB <- dba.report(db.ln)
+db.zh.DB <- dba.report(db.zh)
+
+# write the full DB GR to csv; coerce to df
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_DiffBind_analysis_table.csv" )
+write.csv(x=as.data.frame(db.ln.DB), file=outputname, quote=F, row.names=F, col.names=TRUE)
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_DiffBind_analysis_table.csv" )
+write.csv(x=as.data.frame(db.zh.DB), file=outputname, quote=F, row.names=F, col.names=TRUE)
+
+# output plots
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_DiffBind_analysis_plots.pdf")
+pdf(outputname)
+dba.plotMA(db.ln)
+db.ln.pvals <- dba.plotBox(db.ln)
+corvals <- dba.plotHeatmap(db.ln, contrast=1, correlations=FALSE)
+dba.plotVolcano(db.ln) 
+dev.off()
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_DiffBind_analysis_plots.pdf")
+pdf(outputname)
+dba.plotMA(db.zh)
+db.zh.pvals <- dba.plotBox(db.zh)
+corvals <- dba.plotHeatmap(db.zh, contrast=1, correlations=FALSE)
+dba.plotVolcano(db.zh) 
+dev.off()
+
+# output the volcano plot for the figure:
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_DiffBind_analysis_Volcano.pdf")
+pdf(outputname)
+dba.plotVolcano(db.ln, dotSize=0.3)
+dev.off()
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_DiffBind_analysis_Volcano.pdf")
+pdf(outputname)
+dba.plotVolcano(db.zh, dotSize=0.3)
+dev.off()
+
+##############
+# need to export the regions of interest for EnrichedHeatmap visualisation:
+#
+# take the ATAC DiffBind regions, split into up/down
+##############
+# copy the DiffBind results GR to this obj name so can just run following code...
+gr.ln.enh <- db.ln.DB[order(db.ln.DB$Fold)]
+gr.zh.enh <- db.zh.DB[order(db.zh.DB$Fold)]
+
+# add column to split by = category of Enh = up/down
+gr.ln.enh$split <- c( 
+   rep( "shSOX10 up", times=sum(gr.ln.enh$Fold < 0) ), 
+   rep( "NT up", times=sum(gr.ln.enh$Fold > 0) ) 
+   )
+gr.zh.enh$split <- c( 
+   rep( "shSOX10 up", times=sum(gr.zh.enh$Fold < 0) ), 
+   rep( "NT up", times=sum(gr.zh.enh$Fold > 0) ) 
+   )   
+# write to bed , as above
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_diff_bound_peaks_for_BWAOB.bed" )
+output.bed(gr=gr.ln.enh, peaksetName="ATAC_DiffBind_peak", outputname=outputname)
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_diff_bound_peaks_for_BWAOB.bed" )
+output.bed(gr=gr.zh.enh, peaksetName="ATAC_DiffBind_peak", outputname=outputname)
+
+# shit, will also need to output for HOMER:
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_diff_bound_peaks_NT_up_forHOMER.bed" )
+output.bed(gr=gr.ln.enh[gr.ln.enh$Fold > 0], peaksetName="ATAC_DiffBind_peak", outputname=outputname)
+outputname <- paste0( Sys.Date(), "_LN229_ATAC_diff_bound_peaks_shSOX10_up_forHOMER.bed" )
+output.bed(gr=gr.ln.enh[gr.ln.enh$Fold < 0], peaksetName="ATAC_DiffBind_peak", outputname=outputname)
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_diff_bound_peaks_NT_up_forHOMER.bed" )
+output.bed(gr=gr.zh.enh[gr.zh.enh$Fold > 0], peaksetName="ATAC_DiffBind_peak", outputname=outputname)
+outputname <- paste0( Sys.Date(), "_ZH487_ATAC_diff_bound_peaks_shSOX10_up_forHOMER.bed" )
+output.bed(gr=gr.zh.enh[gr.zh.enh$Fold < 0], peaksetName="ATAC_DiffBind_peak", outputname=outputname)
+
+##############################
+# now: need to get the signal for the samples, at the appropriate regions of interest...
+# use bigWigAverageOverBed (as previously done in the SE analysis)
+##############################
+message("Calculating sample signal (bigWigAverageOverBed)...")
+
+##############
+# now: need to run bigWigAverageOverBed
+##############
+# usage: bigWigAverageOverBed in.bw in.bed out.tab
+#
+# so, first: define args as df
+#
+# example input bw path - SES-normalised intensities:
+#      /icgc/dkfzlsdf/analysis/hipo/hipo_016/user_folder/herrmanc/data/2019-02-21_chipseq_14234/ZH487/NT/SOX10/bw/ZH487_NT_SOX10_SES_subtract.bw
+# for in.bed: use the combined Enh state bedfile exported above
+# out.tab: define per sample
+#
+# for each Enh set (NT, shSOX10, shared), look up the SOX10+BRD4 signal in the LN229 samples.
+# (will viz histone signal using the ChromHMM states!)
+#
+# get a list of the input bw:
+# first get a list of the input bw for the ChIP samples:
+path.bigwig.ln <- system2("find", args=paste0( dir.data, " -name LN229*_SES_subtract.bw"), stdout=TRUE )
+path.bigwig.zh <- system2("find", args=paste0( dir.data, " -name ZH487*_SES_subtract.bw"), stdout=TRUE )
+# need to add in the ATAC intensities also:
+# LN229:
+path.atac.bw.ln <- system2("find", args=paste0( dir.atac, " -name LN229_????.bw"), stdout=TRUE )
+# remove the ones in subdir /sox10/ (sigh)
+path.atac.bw.ln <- path.atac.bw[!grepl(pattern="/sox10/", x=path.atac.bw)]
+# ZH487:
+path.atac.bw.zh <- system2("find", args=paste0( dir.data, " -name ZH487*_adjusted_RPKM.bw"), stdout=TRUE )
+
+# add in the input bedfiles: for the input bed per cell line, look up signal for ATAC/SOX10/BRD4 in NT/sh
+bwaob.args2 <- rbind(
+    # LN229
+    data.frame(
+      path.bigwig = c(path.bigwig.ln, path.atac.bw.ln[c(3,2,1,4)]),
+      in.bed = paste0( Sys.Date(), "_LN229_ATAC_diff_bound_peaks_for_BWAOB.bed" ),  
+      stringsAsFactors=F),
+    # ZH487
+    data.frame(
+      path.bigwig = c(path.bigwig.zh, path.atac.bw.zh[c(1,2,4,3)]),
+      in.bed = paste0( Sys.Date(), "_ZH487_ATAC_diff_bound_peaks_for_BWAOB.bed" ),  
+      stringsAsFactors=F)
+)
+
+#
+# next bits are hardcoded based on order of results of this find call (cell line, condition, factor):
+# LN229, shSOX10, SOX10; LN229, NT, SOX10;  LN229, shSOX10, BRD4;  LN229, NT, BRD4;  
+# LN229, NT, ATAC rep1; rep2; LN229, shSOX10, ATAC rep1; rep2
+# ZH487, NT, SOX10; ZH487, shSOX10, SOX10;  ZH487, NT, BRD4;  ZH487, shSOX10, BRD4;  
+# ZH487, NT, ATAC rep1; rep2; ZH487, shSOX10, ATAC rep1; rep2
+# 
+# populate output .tab table filenames:
+bwaob.args2$out.tab <- paste0( "./sample_signal/", c(
+  "LN229_shSOX10_SOX10_signal_in_ATAC_peaks.tab", "LN229_NT_SOX10_signal_in_ATAC_peaks.tab",
+  "LN229_shSOX10_BRD4_signal_in_ATAC_peaks.tab", "LN229_NT_BRD4_signal_in_ATAC_peaks.tab",
+  "LN229_NT_ATAC_rep1_signal_in_ATAC_peaks.tab", "LN229_NT_ATAC_rep2_signal_in_ATAC_peaks.tab",
+  "LN229_shSOX10_ATAC_rep1_signal_in_ATAC_peaks.tab", "LN229_shSOX10_ATAC_rep2_signal_in_ATAC_peaks.tab",
+  "ZH487_NT_SOX10_signal_in_ATAC_peaks.tab", "ZH487_shSOX10_SOX10_signal_in_ATAC_peaks.tab", 
+  "ZH487_NT_BRD4_signal_in_ATAC_peaks.tab", "ZH487_shSOX10_BRD4_signal_in_ATAC_peaks.tab",
+  "ZH487_NT_ATAC_rep1_signal_in_ATAC_peaks.tab", "ZH487_NT_ATAC_rep2_signal_in_ATAC_peaks.tab",
+  "ZH487_shSOX10_ATAC_rep1_signal_in_ATAC_peaks.tab", "ZH487_shSOX10_ATAC_rep2_signal_in_ATAC_peaks.tab"
+  ) )
+
+# then run bigWigAverageOverBed using system2:
+#
+# apply over the df
+mclapply( X=1:nrow(bwaob.args2),
+         FUN=function(row) system2("bigWigAverageOverBed", args=paste(bwaob.args2[row,1], bwaob.args2[row,2], bwaob.args2[row,3]) ),
+         mc.cores=n.cores )
+message("... done!")
+
+############################################################
+#
+# plot EnrichedHeatmaps of SOX10/BRD4 signal at these ATAC peaks
+# do for LN229 and ZH487 separately
+#
+############################################################
+# LN229
+###############
+# first: load the full signal data from the .bw files, as GRs
+# parallelise with mclapply
+gr.ln.signal <- mclapply(X=bwaob.args2$path.bigwig[grepl(pattern="LN229",x=bwaob.args2$path.bigwig)], 
+	FUN=rtracklayer::import, format="BigWig", mc.cores=n.cores)
+# add names
+names(gr.ln.signal) <- c("shSOX10_SOX10", "NT_SOX10", "shSOX10_BRD4", "NT_BRD4", 
+                         "NT_ATAC_rep1","NT_ATAC_rep2","shSOX10_ATAC_rep1","shSOX10_ATAC_rep2")
+# calculate average signal for the ATAC reps:
+# as used above!
+# NT:
+ab <- c(gr.ln.signal[["NT_ATAC_rep1"]], gr.ln.signal[["NT_ATAC_rep2"]])
+r <- disjoin(ab, with.revmap = TRUE, ignore.strand = TRUE)
+r$score <- sum(extractList(score(ab), r$revmap))/2L
+gr.ln.signal$NT_ATAC <- r # add back to GR of signal
+# shSOX10:
+ab <- c(gr.ln.signal[["shSOX10_ATAC_rep1"]], gr.ln.signal[["shSOX10_ATAC_rep2"]])
+r <- disjoin(ab, with.revmap = TRUE, ignore.strand = TRUE)
+r$score <- sum(extractList(score(ab), r$revmap))/2L
+gr.ln.signal$shSOX10_ATAC <- r # add back to GR of signal
+#
+# remove the replicates from this signal GR
+gr.ln.signal <- gr.ln.signal[ !grepl(pattern="rep", x=names(gr.ln.signal)) ]
+
+# remove shSOX10 SOX10 signal here: don't care about it.
+gr.ln.signal <- gr.ln.signal[ names(gr.ln.signal)!="shSOX10_SOX10" ]
+
+# generate mats for EnrichedHeatmap:
+# args: target=defined target regions; value_column=name of mcol with signal,
+#       extend by 1kbp (each side) around the enhancer, defined mean mode, w=50 windows in these regions
+#       smooth the signal, and remove extreme values above the 99th percentile
+# parallelise with mclapply
+list.mat.signal <- mclapply(X=gr.ln.signal, FUN=normalizeToMatrix, 
+                          target=gr.ln.enh, value_column = "score", extend = 1000, mean_mode = "w0", w = 50,
+                          smooth=TRUE, keep = c(0, 0.99), mc.cores=n.cores )
+# this takes a long time! many intervals!
+
+# define ylims based on eyeballing plots and setting manually:
+ylim.sox10 <- c(0, 75)
+ylim.brd4 <- c(0, 20)
+ylim.atac <- c(0, 9)
+
+# define top line annotation colours for how the rows are split
+# use subtype colours and an extra for the shared regions
+cols.topanno <- c( subtype.colours[c("RTK_I","MES")], "black" )
+
+# define the colour scales for each factor, so heatmap colour intensity is comparable
+# define breaks manually based on looking at heatmaps and with Yonghe's input...
+col.sox10 <- colorRamp2(breaks=c(-50,0,50), colors=c("darkblue","white","red"))
+col.brd4 <- colorRamp2(breaks=c(-25,0,25), colors=c("darkblue","white","red"))
+col.atac <- colorRamp2(breaks=c(-10,0,10), colors=c("darkblue","white","red"))
+
+# generate list of EnrichedHeatmaps:
+# NOTE NOTE use_raster=TRUE here! because these are BIG heatmaps
+list.hm <- EnrichedHeatmap(list.mat.signal$NT_ATAC, col=col.atac, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "NT - ATAC", column_title = "NT\nATAC", use_raster=TRUE,
+         split=gr.ln.enh$split, # split rows as defined above;
+         # plot y-axis labels on right, set ylims as found above (per-factor)
+         top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.atac)) ) +                    
+         EnrichedHeatmap(list.mat.signal$shSOX10_ATAC, col=col.atac, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "shSOX10 - ATAC", column_title = "shSOX10\nATAC", use_raster=TRUE,
+         top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.atac)) ) +
+    EnrichedHeatmap(list.mat.signal$NT_SOX10, col=col.sox10, use_raster = TRUE,
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+         name = "NT - SOX10", column_title = "NT\nSOX10",      
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.sox10)) ) +
+    EnrichedHeatmap(list.mat.signal$NT_BRD4, col=col.brd4, use_raster = TRUE, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "NT - BRD4", column_title = "NT\nBRD4",
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.brd4)) ) +                    
+    EnrichedHeatmap(list.mat.signal$shSOX10_BRD4, col=col.brd4, use_raster = TRUE, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "shSOX10 - BRD4", column_title = "shSOX10\nBRD4",
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.brd4)) ) 
+    
+# output
+outputname <- paste0( Sys.Date(), "_SOX10_ChIPseq_07_LN229_signal_at_LN229_ATAC_peaks.pdf" )
+pdf(outputname)
+list.hm
+dev.off()
+
+###############
+# ZH487
+###############
+# first: load the full signal data from the .bw files, as GRs
+# parallelise with mclapply
+gr.zh.signal <- mclapply(X=bwaob.args2$path.bigwig[grepl(pattern="ZH487",x=bwaob.args2$path.bigwig)], 
+	FUN=rtracklayer::import, format="BigWig", mc.cores=n.cores)
+# add names
+names(gr.zh.signal) <- c("NT_SOX10", "shSOX10_SOX10", "NT_BRD4", "shSOX10_BRD4",
+                         "NT_ATAC_rep1","NT_ATAC_rep2","shSOX10_ATAC_rep1","shSOX10_ATAC_rep2")
+# calculate average signal for the ATAC reps:
+# as used above!
+# NT:
+ab <- c(gr.zh.signal[["NT_ATAC_rep1"]], gr.zh.signal[["NT_ATAC_rep2"]])
+r <- disjoin(ab, with.revmap = TRUE, ignore.strand = TRUE)
+r$score <- sum(extractList(score(ab), r$revmap))/2L
+gr.zh.signal$NT_ATAC <- r # add back to GR of signal
+# shSOX10:
+ab <- c(gr.zh.signal[["shSOX10_ATAC_rep1"]], gr.zh.signal[["shSOX10_ATAC_rep2"]])
+r <- disjoin(ab, with.revmap = TRUE, ignore.strand = TRUE)
+r$score <- sum(extractList(score(ab), r$revmap))/2L
+gr.zh.signal$shSOX10_ATAC <- r # add back to GR of signal
+#
+# remove the replicates from this signal GR
+gr.zh.signal <- gr.zh.signal[ !grepl(pattern="rep", x=names(gr.zh.signal)) ]
+
+# remove shSOX10 SOX10 signal here: don't care about it.
+gr.zh.signal <- gr.zh.signal[ names(gr.zh.signal)!="shSOX10_SOX10" ]
+
+# generate mats for EnrichedHeatmap:
+# args: target=defined target regions; value_column=name of mcol with signal,
+#       extend by 1kbp (each side) around the enhancer, defined mean mode, w=50 windows in these regions
+#       smooth the signal, and remove extreme values above the 99th percentile
+# parallelise with mclapply
+list.mat.signal <- mclapply(X=gr.zh.signal, FUN=normalizeToMatrix, 
+                          target=gr.zh.enh, value_column = "score", extend = 1000, mean_mode = "w0", w = 50,
+                          smooth=TRUE, keep = c(0, 0.99), mc.cores=n.cores )
+# this takes a long time! many intervals!
+
+# define ylims based on eyeballing plots and setting manually:
+ylim.brd4 <- c(0, 20)
+ylim.sox10 <- c(0, 40)
+ylim.atac <- c(0, 120)
+
+# define top line annotation colours for how the rows are split
+# use subtype colours and an extra for the shared regions
+cols.topanno <- c( subtype.colours[c("RTK_I","MES")], "black" )
+
+# define the colour scales for each factor, so heatmap colour intensity is comparable
+# define breaks manually based on looking at heatmaps and with Yonghe's input...
+col.sox10 <- colorRamp2(breaks=c(-50,0,50), colors=c("darkblue","white","red"))
+col.brd4 <- colorRamp2(breaks=c(-25,0,25), colors=c("darkblue","white","red"))
+col.atac <- colorRamp2(breaks=c(-30,0,30), colors=c("darkblue","white","red"))
+
+# generate list of EnrichedHeatmaps:
+# NOTE NOTE use_raster=TRUE here! because these are BIG heatmaps
+list.hm <- EnrichedHeatmap(list.mat.signal$NT_ATAC, col=col.atac, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "NT - ATAC", column_title = "NT\nATAC", use_raster=TRUE,
+         split=gr.zh.enh$split, # split rows as defined above;
+         # plot y-axis labels on right, set ylims as found above (per-factor)
+         top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.atac)) ) +                    
+         EnrichedHeatmap(list.mat.signal$shSOX10_ATAC, col=col.atac, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "shSOX10 - ATAC", column_title = "shSOX10\nATAC", use_raster=TRUE,
+         top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.atac)) ) +
+    EnrichedHeatmap(list.mat.signal$NT_SOX10, col=col.sox10, use_raster = TRUE,
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+         name = "NT - SOX10", column_title = "NT\nSOX10",      
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.sox10)) ) +
+    EnrichedHeatmap(list.mat.signal$NT_BRD4, col=col.brd4, use_raster = TRUE, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "NT - BRD4", column_title = "NT\nBRD4",
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.brd4)) ) +                    
+    EnrichedHeatmap(list.mat.signal$shSOX10_BRD4, col=col.brd4, use_raster = TRUE, 
+                    row_title_rot = 90, axis_name_gp = gpar(fontsize = 6),                           
+                           name = "shSOX10 - BRD4", column_title = "shSOX10\nBRD4",
+    top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col=cols.topanno ), 
+                                                                  yaxis_facing = "right", ylim=ylim.brd4)) ) 
+    
+# output
+outputname <- paste0( Sys.Date(), "_SOX10_ChIPseq_07_ZH487_signal_at_ZH487_ATAC_peaks.pdf" )
+pdf(outputname)
+list.hm
+dev.off()
+
+############################################################
+#
+# plot in the ChromHMM states at these ATAC peaks in the LN229 cells also:
+# get from sox10_kd_chromhmm_heatmap.Rscript
+#
+############################################################
+################
+# source zuguang's epik config file for the hipo016 project
+################
+# can also use library(epik) if that is up-to-date
+load_epik_config("/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/WGBS_final_cohort/script/hipo16_config_epik.R")
+
+# don't load text in tables as factors
+options(stringsAsFactors=F)
+
+# colour definitions
+state_name = c("TssA", "TssFlnk", "TssFlnkU", "TssFlnkD", "Tx", "TxWk", "EnhG1", "EnhG2", "EnhA1", "EnhA2", "EnhWk", "ZNF/Rpts", "Het",
+    "TssBiv", "EnhBiv", "ReprPC", "ReprPCWk", "Quies")
+names(state_name) = paste0("E", ifelse(nchar(1:18) == 1, "0", ""), 1:18)
+state_col = c("#FF0000", "#FF4500", "#FF4500", "#FF4500", "#008000", "#006400",
+    "#C2E105", "#C2E105", "#FFC34D", "#FFC34D", "#FFFF00", "#66CDAA", "#8A91D0",
+    "#CD5C5C", "#BDB76B", "#808080", "#C0C0C0", "#FFFFFF")
+names(state_col) = names(state_name)
+
+# now: use epik to load the ChromHMM states for each subtype
+# see ipynb 20180207 also
+#
+# get chromhmm states for contrasting subtype
+# set merge=T to get consensus
+metadata <- readRDS(path.metadata.rds) # load metadata df
+states.rtki <- get_chromHMM_list( metadata$ak_id[metadata$subtype_final=="RTK_I"], merge=T)
+states.mes <- get_chromHMM_list( metadata$ak_id[metadata$subtype_final=="MES"], merge=T)
+
+# now: also load for each of the cell lines, in turn:
+# load chromhmm 4-col beds (chrom, start, end, state) as text and coerce to gr to match tumour data loaded above
+states.nt <- read.bed("/icgc/dkfzlsdf/analysis/hipo/hipo_016/yonghe/new/BinarizeBam/CON/CON_18_segments.bed", colnames=c("chrom", "start", "end", "states") )
+states.sh <- read.bed("/icgc/dkfzlsdf/analysis/hipo/hipo_016/yonghe/new/BinarizeBam/DOX/DOX_18_segments.bed", colnames=c("chrom", "start", "end", "states") )
+
+############################################################
+#
+# coerce states to numeric values, 1-18
+# then map heatmap colours to those values
+#
+############################################################
+# first: rename all states in loaded states GRs to remove the trailing E
+states.rtki$states <- as.numeric(gsub( pattern="E", replacement="", x=states.rtki$states ))
+states.mes$states <- as.numeric(gsub( pattern="E", replacement="", x=states.mes$states ))
+# here the states mcols are called 'l'.
+states.nt$l <- as.numeric(gsub( pattern="E", replacement="", x=states.nt$l ))
+states.sh$l <- as.numeric(gsub( pattern="E", replacement="", x=states.sh$l ))
+
+###############
+#
+# okay: follow zuguang's suggestion in email today
+#
+# otherwise the normalizeToMatrix() function will get averages of the state values, heh
+#
+# states_normal$value = as.numeric(gsub("_.*$", "", states_normal$states))
+# mat = normalizeToMatrix(states_normal, tss[1:1000], value_column = "value")
+# EnrichedHeatmap(mat, col = colorRamp2(1:7, state_col), cluster_rows = TRUE)
+# 
+# Basically, you need to:
+# 1. reduce the number of states, e.g. merge 1-4 as active tss states, 16-17 as repressive states
+# 2. assign a value for each simplified states, e.g. 1 for active states 2 for tx states, ...
+# 3. make the normalized matrix 
+# 4. visualize the matrix as heatmap with define color for each state
+#
+# so let's do that: first, reduce state number in new mcol
+#
+# based on state_name: map 1-4 to Tss, 5-6 to Tx, 7-11 to Enh, 12-13 to Het/Rpts, 14-15 to Biv, 16-17 to ReprPC, 18 to Quiescent
+reduce_ChromHMM_18states <- function( states )
+{
+    # take input states vector, and then map as above
+    # TSS to 1
+    states[ states==1 | states==2 | states==3 | states==4 ] <- 1
+    # Tx to 2
+    states[ states==5 | states==6 ] <- 2
+    # Enh to 3
+    states[ states==7 | states==8 | states==9 | states==10 | states==11 ] <- 3
+    # Het/Rpts to 4
+    states[ states==12 | states==13 ] <- 4
+    # Biv to 5
+    states[ states==14 | states==15 ] <- 5
+    # ReprPc to 6
+    states[ states==16 | states==17 ] <- 6
+    # Quiescent to 7
+    states[ states==18 ] <- 7
+    # return mapped states vector
+    return(states)
+}
+# now add in as new col
+states.rtki$states_reduced  <- reduce_ChromHMM_18states(states.rtki$states)
+states.mes$states_reduced  <- reduce_ChromHMM_18states(states.mes$states)
+states.nt$states_reduced  <- reduce_ChromHMM_18states(states.nt$l)
+states.sh$states_reduced  <- reduce_ChromHMM_18states(states.sh$l)
+
+#############################################
+# 
+# produce bar plots of TSS/Enh states in the diffbound ATAC peaks
+# in LN229 NT/SH and tumours
+#
+# need to re-calc from the original 18-state GRs; as can double-count with the EnrichedHeatmap matrices
+#
+#############################################
+mat.chromhmm.full <- mclapply( X=list(LN229_NT=states.nt, LN229_shSOX10=states.sh,
+                                 RTK_I=states.rtki, MES=states.mes),
+                        FUN=normalizeToMatrix, target=gr.ln.enh,
+                        extend=1000, w=50, value_column="states_reduced", mc.cores=n.cores)
+# 
+# open output df
+res.chromhmm <- data.frame( sample=rep(names(mat.chromhmm.full), times=4),
+                            peakset=rep( c(rep("NT up", length(mat.chromhmm.full)), rep("shSOX10 up", length(mat.chromhmm.full))), 2),
+                            State=rep( c( rep("TSS",4), rep("Enh",4) ), 2 ),
+                            pc=0, 
+                            stringsAsFactors=F)
+# add additional columns based on hardcoding here...
+res.chromhmm$State <- c( rep("TSS", 8), rep("Enh", 8))
+res.chromhmm$Tissue <- rep( c(rep("LN229", 2), rep("Tumour", 2)), 4)
+res.chromhmm$Condition <- factor( c("NT","shSOX10","RTK_I","MES","NT","shSOX10","RTK_I","MES",
+                                 "NT","shSOX10","RTK_I","MES","NT","shSOX10","RTK_I","MES"),
+                                 levels=c("NT","shSOX10","RTK_I","MES") ) # factor with this order for plotting
+# take list of matrices,
+# loop over that list:
+for( mat in names(mat.chromhmm.full) )
+{
+    # extract the target regions: 
+    targ <- mat.chromhmm.full[[mat]][,attr(mat.chromhmm.full[[mat]], "target_index")]
+
+    # also need to loop over the split = NT or shSOX10 peaks:
+    for( split in unique(gr.ln.enh$split) )
+    {
+        # extract the rows for that split
+        targ2 <- targ[ gr.ln.enh$split==split, ]
+        # round in case of non-integer states (!?)
+        targ2 <- round(targ2)
+        
+        # categorise these regions:
+        # sum up where states = 1(TSS) or 3 (Enh)
+        n.tss <- apply(targ2, MARGIN=1, FUN=function(row) sum(row %in% 1) )
+        n.enh <- apply(targ2, MARGIN=1, FUN=function(row) sum(row %in% 3) )
+        
+        # define any target region as TSS or Enh based on:
+        # there being more of that state than the other; and at least 1.
+        res.chromhmm$pc[res.chromhmm$sample==mat & res.chromhmm$peakset==split & res.chromhmm$State=="TSS"] <- 100*sum(n.tss > 0 & n.tss > n.enh)/length(n.tss)
+        res.chromhmm$pc[res.chromhmm$sample==mat & res.chromhmm$peakset==split & res.chromhmm$State=="Enh"] <- 100*sum(n.enh > 0 & n.enh > n.tss)/length(n.enh)
+    }
+}
+# define colours for this 
+cols.plot <- c(state_col[1], state_col[7])
+names(cols.plot) <- c("TSS","Enh")
+# output plot
+outputname <- paste0( Sys.Date(), "_SOX10_ChIPseq_11_LN229_ATAC_diff_bound_peaks_ChromHMM_TSS-Enh_states.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot(data=res.chromhmm, aes(x=Condition, y=pc, fill=State)) + geom_bar(stat="identity") + 
+facet_grid( peakset ~ Tissue, scales="free" ) + xlab(NULL) + ylab("percentage of ATAC peaks") +
+theme_bw() + scale_fill_manual(values=cols.plot)
+dev.off()
+
+############################################################
+############################################################
+#
+#
+# SAVE COPY OF SESSION INFO AND R ENVIRONMENT
+#
+#
+############################################################
+############################################################
+# session info
+seshinf <- paste ( Sys.Date(), "_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)
+
+# Renv
+outputname <- paste( Sys.Date(), "_end_Renv.Rdata", sep="")
+save.image(file=outputname)

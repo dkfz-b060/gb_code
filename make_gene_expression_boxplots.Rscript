@@ -1,0 +1,153 @@
+#!/bin/R-3.4.2
+#
+# make_gene_expression_boxplots.Rscript
+#
+# 20190807
+# by Mike
+#
+# make boxplots for certain genes of interest for the manuscript
+# (do them in R so they're all the SAME KIND of boxplot!)
+# 
+# currently need them for:
+#	MYT1 (1F) - plot without NBr
+#	CALCRL, TGFBI, GPR17, EGFR (3A)
+#
+# 20191017 - add additional genes from Pavle (see email 20191014)
+#	CXCL14, IL34
+#
+#########################################################
+#
+# INPUT DATA AND OUTPUTS
+#
+# input: need Zuguang's TPM matrix; sample metadata; and the genes
+#
+# outputs: the boxplots! to the dir: 
+#
+#########################################################
+# 
+# CLUSTER RESOURCES
+#
+# request small interactive job: qsub -I -l walltime=1:00:00,mem=8g,nodes=1
+# and load R 3.4.3 bundle: module load R-bundle/20171215-foss-2017a-R-3.4.3
+#
+#########################################################
+#
+# SETUP: funs, libs, output.dir etc
+#
+#########################################################
+
+# define genes of interest:
+goi <- c("CALCRL","TGFBI","GPR17","EGFR","CXCL14","IL34")
+
+message( "Loading libraries...")
+
+# load libs
+suppressMessages( library(ggplot2) )
+
+# load libs for annotation
+suppressMessages( library("AnnotationDbi") )
+suppressMessages( library("org.Hs.eg.db") )
+
+message( "Loading libraries... done!")
+
+# load common HIPO016 code
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+# add colour for normal brain to subtype colours vector
+subtype.colours <- c(subtype.colours, "normal"="orange")
+
+##########
+#
+# LOAD DATA AND METADATA
+#
+##########
+
+message( "Loading data, setting up output directory...")
+
+# work in appropriate directory
+setwd(dir="/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/RNAseq_subtype_genes/")
+
+# load metadata
+metadata <- readRDS(path.metadata.rds)
+
+# remove normal/excluded samples
+# based on 'subtype_final' keep only the 4 subtypes (drop 'exclude' and 'normal'):
+metadata <- metadata[ metadata$subtype_final!="exclude", ]
+# need to re-level this factor:
+# order so NBr is first, then subtypes alphabetically
+metadata$subtype_final <- factor(metadata$subtype_final, levels=c("normal", "IDH", "MES", "RTK_I", "RTK_II"))
+
+# get the TPM matrix
+load(path.rnaseq.matrix)
+# it's called 'rpkm' but it's TPMs!
+# transform to log2 TPM+1
+rpkm <- log2(rpkm+1)
+
+# replace with gene names: split to remove .XX ensg version
+rownames(rpkm) <- sapply(strsplit( rownames(rpkm) , "[.]"), "[", 1)
+# then look up gene symbols:
+rownames(rpkm) <- convertIDs( rownames(rpkm), "ENSEMBL", "SYMBOL", org.Hs.eg.db, ifMultiple="useFirst")
+
+##########
+#
+# MAKE PLOTS
+#
+##########
+#
+# 1A: MYT
+# include normal here.
+#
+##########
+# build df: get the expression values from matrix; get subtype/ID from metadata
+plot.df <- data.frame(
+	sample=metadata$ak_id,
+	subtype=metadata$subtype_final,
+	expression=rpkm[ "MYT1", match( metadata$ak_id, colnames(rpkm)) ],
+	stringsAsFactors=F)
+	
+# output:
+outputname <- paste0(Sys.Date(), "_MYT1_gx_boxplot.pdf")
+pdf(outputname, height=6, width=4)
+ggplot(data=plot.df, aes(x=subtype, y=expression, fill=subtype)) + geom_boxplot() + scale_fill_manual(values=subtype.colours) +
+theme_bw() + xlab(NULL) + ylab("RNA-seq expression (log2(TPM+1))") + guides(fill=FALSE) + 
+ggtitle("MYT1")
+dev.off()	
+
+
+##########
+#
+# 3A: 
+# exclude normal
+#
+##########
+# first remove normal from metadata:
+metadata <- metadata[ metadata$subtype_final!="normal", ]
+# need to re-level this factor:
+metadata$subtype_final <- factor(metadata$subtype_final)
+
+# loop over genes:
+for( gene in goi )
+{
+	message(paste0("Plotting: ", gene))
+	
+	# build df: get the expression values from matrix; get subtype/ID from metadata
+	plot.df <- data.frame(
+		sample=metadata$ak_id,
+		subtype=metadata$subtype_final,
+		expression=rpkm[ gene, match( metadata$ak_id, colnames(rpkm)) ],
+		stringsAsFactors=F)
+		
+	# output:
+	outputname <- paste0(Sys.Date(), "_", gene, "_gx_boxplot.pdf")
+	pdf(outputname, height=6, width=4)
+	# print inside for() loop!
+	print( ggplot(data=plot.df, aes(x=subtype, y=expression, fill=subtype)) + geom_boxplot() + scale_fill_manual(values=subtype.colours) +
+	theme_bw() + xlab(NULL) + ylab("RNA-seq expression (log2(TPM+1))") + guides(fill=FALSE) + ggtitle(gene) )
+	dev.off()	
+
+# close for loop	
+}
+
+# save session info:
+seshinf <- paste ( Sys.Date(), "_gx_boxplots_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)

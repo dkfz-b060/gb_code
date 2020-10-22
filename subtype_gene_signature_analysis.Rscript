@@ -1,0 +1,408 @@
+#!/bin/R-3.4.3
+
+# subtype_gene_signature_analysis.Rscript
+#
+# v3 20180516 - add clusterProfiler pathway enrichment 
+# v2 20180111 - updated for R v3.4.3, removed TCGA comparison
+# 20170712
+# Mike
+#
+#########################
+# WHAT DOES IT DO
+#
+# Takes the GBM subtype gene expression signatures (see subtype_genes_limma.Rscript) and does
+# further analysis:
+# 
+#	- comparing them to other signatures: 
+#		- Cahoy normal mouse brain cell signatures (per-sample)
+#	- run ESTIMATE to estimate (hoh) immune/stromal cell content  
+#	- checks the mSigDB hallmark set of cancer processes
+#	- uses the clusterProfiler package to do enrichment testing (but with relaxed thresholds, see below)
+#
+# Inputs: 
+#	(i) gene expression matrices - as prepared by Zuguang, processed+saved in subtype_genes_limma.Rscript
+#		will load both the original Rdata object (for RPKM values for ESTIMATE) and the limma-processed GX values
+#	(ii) sample metadata (with subtypes) - as prepared by Zuguang, processed+saved in subtype_genes_limma.Rscript
+#	(iii) Broad MSigDB in .xml format - current version 5.1
+#	(iv) Cahoy signatures - use GSVA: https://bioconductor.org/packages/release/bioc/html/GSVA.html
+#		see ipynb 20161201 for details
+#	(v) ESTIMATE - http://www.nature.com/ncomms/2013/131011/ncomms3612/full/ncomms3612.html
+#				and http://bioinformatics.mdanderson.org/main/ESTIMATE:Overview
+#		see ipynb 20161128 for details
+#
+# Outputs:
+#	(i) npGSEA results html files for the subtype analysis vs. mSigDB
+#	(ii) tables and plots for the GSVA vs Cahoy signatures, and ESTIMATE purity scores
+#
+#########################
+# USAGE
+#		Rscript /path/to/subtype_gene_signature_analysis.Rscript
+#
+#	OUTPUTS TO:
+#		analysis directory (will be created): /icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/RNAseq_subtype_genes_signatures_analysis
+#
+#########################
+
+################################################################
+#
+# START CODE
+#
+################################################################
+#
+# SETUP: command line args, funs, libs, gsea.outputdir etc
+#
+################################################################
+# load libraries
+message( "\nLoading libraries...\n")
+suppressMessages( library(npGSEA) )
+suppressMessages( library(limma) )
+suppressMessages( library(ReportingTools) )
+suppressMessages( library(GSEABase) )
+suppressMessages( library("AnnotationDbi") )
+suppressMessages( library("org.Hs.eg.db") )
+suppressMessages( library(GSVA) ) # GSVA needed for Cahoy signatures
+suppressMessages( library(GSVAdata) ) 
+suppressMessages( library(ggplot2) )
+suppressMessages( library(estimate) )
+suppressMessages( library(clusterProfiler) )
+
+################
+# FUNCTION TO PRODUCE HTML REPORT
+#
+# from npGSEA vignette
+# produce html report using ReportingTools package
+#
+# OPTIONS:
+# gsea.input = input npGSEA object 
+# shortName = name of output HTML file
+# reportDirectory = directory for output
+# title = title for output HTML file
+# genesetcollection = GeneSetCollection obj used in npGSEA analysis
+# adjpvalthr = multiple testing adjusted pval threshold to filter results
+#
+# n.b. the annotation.db used in publish() is the same as I'm using so that's cool.
+gsea.report <- function( gsea.input, shortName, title, reportDirectory="./reports", genesetcollection ) {
+  # calculate adj pvals
+  adjpvals <- p.adjust( unlist(pTwoSided(gsea.input)), method= "BH" )
+  # generate report
+  npgseaReport <- HTMLReport(shortName = shortName, title = title, reportDirectory = reportDirectory )
+  publish(genesetcollection, npgseaReport, annotation.db = "org.Hs.eg", setStats = unlist(zStat(gsea.input)), setPValues = adjpvals)
+  finish(npgseaReport)
+}
+
+################
+#
+# RESOURCES
+#
+# load common HIPO016 code
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+# path to GSEA resources dir
+# for hipo016 this is /icgc/dkfzlsdf/analysis/hipo/hipo_016/gsea
+gsea.res.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/gsea"
+message( paste( "Directory with GSEA resources:", gsea.res.dir ) )
+
+# GX matrices from Zuguang - loads 'counts' and 'rpkm' matrices
+load(path.rnaseq.matrix)
+
+# also load the saved limma ResObj: sample-filtered voom GX values (name: 'voom.tmm') + filtered metadata ('metadata')
+load(limma.renv)
+
+# set analysis dir as working dir
+analysis.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/"
+setwd(analysis.dir)
+
+# make new output directory in working dir
+# provide as relative path so npGSEA doesn't flip out
+gsea.outputdir <- "RNAseq_subtype_genes_signatures_analysis"
+
+message( paste( "Output directory (will be created):", gsea.outputdir ) )
+
+# create output directory
+system2("mkdir", args=gsea.outputdir)
+
+################################################################
+#
+# LOAD AND PRE-PROCESS GENE EXPRESSION DATA
+#
+################################################################
+# now: input for the npGSEA() function requires an expression matrix
+# for our setup we want to have 1 expression matrix, per subtype
+# 
+# so let's extract data based on matching the metadata$subtype_final
+#
+# sanity check: are the column names in the experimental GX matrix the same order as in the metadata df?
+metadata$ak_id == colnames(voom.tmm$E)
+# all T == good
+
+# now need to ensure have the same gene IDs between the expr data and the gene sets
+# gene sets are in gene symbol format so easiest to convert the voom.tmm$E rownames (currently ENSG ID) to that also
+# use functions+code from the limma pipeline Rscript
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+# then convert IDs to HGNC symbol
+rownames(voom.tmm$E) <- convertIDs( sapply(strsplit( rownames(voom.tmm$E), "[.]"), "[", 1), "ENSEMBL", "SYMBOL", org.Hs.eg.db)
+
+# now drop the rownames with NA = no IDs
+voom.tmm$E <- voom.tmm$E[ !is.na(rownames(voom.tmm$E)), ]
+
+################################################################
+#
+# RUN npGSEA FOR MSIGDB - versus subtypes
+#
+################################################################
+# SETUP
+################################################################
+# read in input msigdb collections (.gmt format)
+# for all collections set collectionType as 'c2' because... you need to set something, and you can't use 'h' or 'c6' for some idiot reason
+msigdb <- GeneSetCollection(
+	    getGmt(con=paste( gsea.res.dir, "/h.all.v5.1.symbols.20160119.gmt", sep=""), geneIdType=SymbolIdentifier(), collectionType=BroadCollection("c2")
+		) )
+# need to filter out gene sets with too few genes
+# try 25
+msigdb.filt <- msigdb[ sapply( geneIds(msigdb), length ) > 25 ]
+
+####################
+# run for each subtype: use for loop
+####################
+for( subtype in c("IDH", "MES", "RTK_I", "RTK_II") )
+	{
+		# run GSEA
+		gsea <- npGSEA( x=voom.tmm$E, y=as.factor(metadata$subtype_final==subtype), set=msigdb.filt) 
+		# plot output using gsea.report function
+		# generate shortName title etc based on date
+		outputname <- paste(  "npGSEA_MSigDBv5.1_selected_in_", subtype, "_", Sys.Date(), sep="")
+		title <- paste("npGSEA report - GSEA of MSigDb gene sets (v5.1, selected collections) in ", subtype, sep="")
+		gsea.report(gsea.input=gsea, shortName=outputname, title=title, genesetcollection=msigdb.filt, reportDirectory=gsea.outputdir )
+	}		
+
+################################################################
+#
+# RUN GSVA FOR CAHOY SIGNATURES	
+#
+################################################################
+# based on GSVA user's guide: 
+# load the data containing the Cahoy brain cell sigs:
+data(brainTxDbSets) # loaded list is named as such.
+
+# get RPKM values as input for ssGSEA analysis:
+gx <- rpkm
+# filter this RPKM matrix for the samples present in filtered metadata:
+gx <- gx[ , !is.na( match(colnames(gx), metadata$ak_id) ) ]
+
+# now need to ensure have the same gene IDs between the expr data and the gene sets
+# gene sets are in gene symbol format so easiest to convert the gx rownames (currently ENSG ID) to that also
+# use functions+code from the limma pipeline Rscript
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+# then convert IDs to HGNC symbol
+rownames(gx) <- convertIDs( sapply(strsplit( rownames(gx), "[.]"), "[", 1), "ENSEMBL", "SYMBOL", org.Hs.eg.db)
+# now drop the rownames with NA = no IDs
+gx <- gx[ !is.na(rownames(gx)), ]
+
+#############################################
+#
+# run GSVA
+#
+#############################################
+# as per the GSVA user guide:
+# use method ssgsea
+# for cahoy:
+cahoy.brain.gsva <- gsva(gx, brainTxDbSets, method="ssgsea", annotation="SYMBOL", mx.diff=FALSE, verbose=TRUE, parallel.sz=1, rnaseq=TRUE)
+# warning (for both):
+#
+# Warning message:
+# In .local(expr, gset.idx.list, ...) :
+#   319 genes with constant expression values throuhgout the samples
+#
+#############################################
+# output the GSVA results as csv for input into other analyses:
+#############################################
+# do for Cahoy sigs
+# define output name + output:
+outputname <- paste( gsea.outputdir, "/", "HIPO016_samples_ssGSEA_TCGA_Cahoy_brain_GX_signatures_", Sys.Date(), ".csv", sep="" )
+write.csv( x=cahoy.brain.gsva, file=outputname )
+
+######################################
+#
+# collect scores in df for ggplot2
+#
+######################################
+# define clusters df:
+# rows = samples
+# columns = 1. ak id, 2. subtype
+#
+# match subtype based on column order in metadata
+clusters <- data.frame( sample_id=metadata$ak_id, subtype=metadata$subtype_final )
+
+# generate df for ggplot2 plotting
+# want to get rows = data point with:
+# sample ID; cluster; ssGSEA score type; ssGSEA score value
+#
+# build off same clusters df as defined for ESTIMATE scores
+plot.ssgsea <- rbind(
+	data.frame( clusters, score_type=rep(x="Cahoy_astrocyte_UP",times=dim(clusters)[1]), score=cahoy.brain.gsva["astrocytic_up",][match(clusters$sample_id, colnames(cahoy.brain.gsva))] ),
+	data.frame( clusters, score_type=rep(x="Cahoy_astroglia_UP",times=dim(clusters)[1]), score=cahoy.brain.gsva["astroglia_up",][match(clusters$sample_id, colnames(cahoy.brain.gsva))] ),
+	data.frame( clusters, score_type=rep(x="Cahoy_neuronal_UP",times=dim(clusters)[1]), score=cahoy.brain.gsva["neuronal_up",][match(clusters$sample_id, colnames(cahoy.brain.gsva))] ),
+	data.frame( clusters, score_type=rep(x="Cahoy_oligodendrocytic_UP",times=dim(clusters)[1]), score=cahoy.brain.gsva["oligodendrocytic_up",][match(clusters$sample_id, colnames(cahoy.brain.gsva))] )
+	)
+
+######################################
+#
+# RUN ESTIMATE per-sample
+#
+######################################
+##### START ESTIMATE ANALYSIS
+#
+##### GENERATE GCT FILE FROM INPUT GX MATRIX
+# first: use filtered gx from above and extract the 'common genes' from the analysis
+# write to new output file
+#
+# their filterCommonGenes function sucks a load of ass so use their code myself:
+id <- "GeneSymbol"
+input.df <- gx
+output.f <- paste( gsea.outputdir, "/HIPO016_ESTIMATE_input_", Sys.Date(), ".gct", sep="") 
+# merge on rownames, specify Gene Symbols:
+merged.df <- merge(common_genes, input.df, by.x = id, by.y = "row.names")
+# remove rows with duplicate GeneSymbol (otherwise everything breaks):
+merged.df <- merged.df[ !duplicated(merged.df$GeneSymbol), ]
+# works...!
+rownames(merged.df) <- merged.df$GeneSymbol
+merged.df <- merged.df[, -1:-ncol(common_genes)]
+print(sprintf("Merged dataset includes %d genes (%d mismatched).",
+        nrow(merged.df), nrow(common_genes) - nrow(merged.df)))
+# [1] "Merged dataset includes 9931 genes (481 mismatched)."
+# output as GCT:
+outputGCT(merged.df, output.f)
+
+###### ESTIMATE SCORE
+# input: gct file from previous step
+# output: gct file with scores i guess
+# platform: nfi but given we have RNAseq data, "illumina"?
+output.gct <- paste( gsea.outputdir, "/HIPO016_ESTIMATE_output_", Sys.Date(), ".gct", sep="")
+estimateScore( output.f, output.gct, platform="illumina")
+# gives:
+#[1] "1 gene set: StromalSignature  overlap= 135"
+#[1] "2 gene set: ImmuneSignature  overlap= 138"
+#
+# so we lose a few genes from each Signature.
+
+# now also plot purity scores:
+#
+# well we have the scores in the output .gct file above, at least...
+# want to get rows = data point with:
+# sample ID; cluster; score type; score value
+
+# read in the output .gct
+estimate.scores <- read.table( output.gct, header=T, skip=2, quote="")
+
+# now: look up the 3 types of scores + combine into a single df
+# base off the "clusters" df used for the ssGSEA plotting above
+plot.estimate <- rbind(
+	data.frame( clusters, score_type=rep(x="Stromal",times=dim(clusters)[1]), score=as.numeric(estimate.scores[ estimate.scores$NAME=="StromalScore", match( clusters$sample_id, colnames(estimate.scores) ) ]) ),
+	data.frame( clusters, score_type=rep(x="Immune",times=dim(clusters)[1]), score=as.numeric(estimate.scores[ estimate.scores$NAME=="ImmuneScore", match( clusters$sample_id, colnames(estimate.scores) ) ]) ),
+	data.frame( clusters, score_type=rep(x="ESTIMATE",times=dim(clusters)[1]), score=as.numeric(estimate.scores[ estimate.scores$NAME=="ESTIMATEScore", match( clusters$sample_id, colnames(estimate.scores) ) ]) )
+	)
+
+#############################################
+#
+# plot:
+#
+#############################################
+# combine dataframes
+plot.df <- rbind( plot.ssgsea, plot.estimate )
+
+# plot using ggplot2
+# generate outputname
+outputname <- paste( gsea.outputdir, "/", "ESTIMATE_Cahoy_scores_plots_", Sys.Date(), ".pdf", sep="" )
+# title
+title <- "ESTIMATE and Cahoy mouse brain cell signature ssGSEA scores"
+# open output file
+ppi <- 300 # define ppi
+pdf(outputname, height=7, width=10)
+# plot violins, with statistic=value, add title
+ggplot( plot.df, aes(x=subtype, y=score, fill=subtype) ) + geom_violin() + ggtitle(title) +
+# add additional boxplots
+geom_boxplot(width=.1, fill="white", outlier.colour="black") +
+# facet by cluster (horizontally) and score type (vertically), with free x scale = don't include every sample ID in every facet
+facet_wrap( ~score_type, ncol=4, scales="free" ) + xlab(NULL) + ylab(NULL) + # drop x/y axis labels
+scale_fill_manual(values=subtype.colours) + # colour by subtype
+# theme: b/w, tidy up legend, remove x-axis ticks and text, fill facet header boxes with white (not grey default)
+theme_bw() + theme( legend.position="none", axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+                  strip.background=element_rect(fill="white"))
+dev.off()
+
+#############################################
+#
+# also: functionally annotate each subtype sig, using clusterProfiler
+# get all UP-regulated genes with FDR < 0.05
+# (default 0.001 is too stringent, need more genes; go from 366-1101 to >~900)
+#
+# as input: need lists of entrez gene IDs
+# so use convertIDs function to do so on ensembl_gene column of each limma result df
+#
+############################################# 
+cp.genes <- list(
+  IDH=convertIDs(ids=limma.idh$ensembl_gene[ limma.idh$logFC > 0 & limma.idh$adj.P.Val < 0.05 ],  "ENSEMBL", "ENTREZID", org.Hs.eg.db),
+  MES=convertIDs(ids=limma.mes$ensembl_gene[ limma.mes$logFC > 0 & limma.mes$adj.P.Val < 0.05 ],  "ENSEMBL", "ENTREZID", org.Hs.eg.db),
+  RTK_I=convertIDs(ids=limma.rtki$ensembl_gene[ limma.rtki$logFC > 0 & limma.rtki$adj.P.Val < 0.05 ],  "ENSEMBL", "ENTREZID", org.Hs.eg.db),
+  RTK_II=convertIDs(ids=limma.rtkii$ensembl_gene[ limma.rtkii$logFC > 0 & limma.rtkii$adj.P.Val < 0.05 ],  "ENSEMBL", "ENTREZID", org.Hs.eg.db)
+)
+# remove NAs
+cp.genes <- lapply( cp.genes, function(x) x[!is.na(x)])
+
+# run enrichment: for each function in turn
+# use 0.1 pval cutoff so that all subtype sigs have some enriched categories
+pval <- 0.1
+res.go <- compareCluster(gene=cp.genes, fun="enrichGO", OrgDb=org.Hs.eg.db, pvalueCutoff=pval) # GO
+res.kegg <- compareCluster(gene=cp.genes, fun="enrichKEGG", pvalueCutoff=pval) # KEGG pathways
+res.do <- compareCluster(gene=cp.genes, fun="enrichDO", pvalueCutoff=pval) # DOSE
+
+##############################
+# generate outputs:
+##############################
+# dotplots; show more categories than default 5
+#
+# GO
+outputname <- paste0( "Subtype_upregulated_signature_genes_enrichment_in_GO_", Sys.Date(), ".pdf")
+pdf(outputname, height=12, width=12)
+dotplot(res.go, showCategory = 10)
+dev.off()
+# KEGG
+outputname <- paste0( "Subtype_upregulated_signature_genes_enrichment_in_KEGG_", Sys.Date(), ".pdf")
+pdf(outputname, height=12, width=12)
+dotplot(res.kegg, showCategory = 10)
+dev.off()
+# DO
+outputname <- paste0( "Subtype_upregulated_signature_genes_enrichment_in_DO_", Sys.Date(), ".pdf")
+pdf(outputname, height=12, width=12)
+dotplot(res.do, showCategory = 10)
+dev.off()
+
+# and text tables:
+outputname <- paste0( "Subtype_upregulated_signature_genes_enrichment_in_GO_table_", Sys.Date(), ".csv")
+write.csv(x=res.go@compareClusterResult,file=outputname)
+outputname <- paste0( "Subtype_upregulated_signature_genes_enrichment_in_KEGG_table_", Sys.Date(), ".csv")
+write.csv(x=res.kegg@compareClusterResult,file=outputname)
+outputname <- paste0( "Subtype_upregulated_signature_genes_enrichment_in_DO_table_", Sys.Date(), ".csv")
+write.csv(x=res.do@compareClusterResult,file=outputname)
+
+#############################################
+#
+# Output results objects and session info
+#
+#############################################
+# results objects:
+outputname <- paste( gsea.outputdir, "/", Sys.Date(), "_gene_signature_analysis_ResObj.Rdata", sep="" )
+save( cahoy.brain.gsva, clusters, estimate.scores, gx, input.df, merged.df, metadata, plot.df,
+	plot.estimate, plot.ssgsea, voom.tmm, res.go, res.kegg, res.do, cp.genes,
+	file=outputname )
+
+# session info:
+seshinf <- paste ( gsea.outputdir, "/", Sys.Date(), "_gene_signature_analysis_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)
+

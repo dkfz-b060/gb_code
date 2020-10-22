@@ -1,0 +1,550 @@
+#!/bin/R-3.4.2
+#
+# subtype_genes_limma.Rscript
+#
+# 20171219 v2 - update script to run on b06x cluster, R v3.4.2
+# 20170711 v1 - adapted from previous limmavoom_subtype_DEanalysis.Rscript
+# by Mike
+#
+# limma+voom differential expression analysis of HIPO016 RNAseq data
+# identify cancer subtype-specific genes by comparing them to all other cancer subtypes
+# 
+# on the FINALISED list of samples and their classifications (n=60)
+# and then also run on the CIMPneg subtypes only (n=50 samples)
+#
+#########################################################
+#
+# SETUP: funs, libs, output.dir etc
+#
+#########################################################
+
+message( "Loading libraries...")
+
+# load libs
+suppressMessages( library(limma) )
+suppressMessages( library(edgeR) )
+# plot: load libraries
+suppressMessages( library("gplots") )
+suppressMessages( library("RColorBrewer") )
+suppressMessages( library(ggplot2) )
+
+# load libs for annotation
+suppressMessages( library("AnnotationDbi") )
+suppressMessages( library("org.Hs.eg.db") )
+
+message( "Loading libraries... done!")
+
+# load common HIPO016 code
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+##########
+#
+# LOAD DATA AND METADATA
+#
+##########
+
+message( "Loading data, setting up output directory...")
+
+# work in appropriate directory
+setwd(dir="/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/")
+# define output directory
+output.dir <- "RNAseq_subtype_genes/"
+# create output directory
+system2("mkdir", args=output.dir)
+# also create subdirectories for various outputs:
+# general plots
+output.dir.qc <- paste0(output.dir, "plots_qc/")
+system2("mkdir", args=output.dir.qc) 
+# tables for 4-subtype analysis
+output.dir.tab <- paste0(output.dir, "tables_degenes/")
+system2("mkdir", args=output.dir.tab) 
+# per-gene plots for 4-subtype analysis
+output.dir.plot <- paste0(output.dir, "plots_genes/")
+system2("mkdir", args=output.dir.plot) 
+# tables for CIMPneg analysis
+output.dir.tab.cimpneg <- paste0(output.dir, "tables_degenes_CIMPneg/")
+system2("mkdir", args=output.dir.tab.cimpneg) 
+# per-gene plots for CIMPneg analysis
+output.dir.plot.cimpneg <- paste0(output.dir, "plots_genes_CIMPneg/")
+system2("mkdir", args=output.dir.plot.cimpneg) 
+# saved R objs, session info, etc.
+output.dir.objs <- paste0(output.dir, "R_objects/")
+system2("mkdir", args=output.dir.objs) 
+
+# load processed expression data object from Zuguang's pipeline
+load(path.rnaseq.matrix)
+# get raw counts
+counts.raw <- count
+
+# load metadata:
+# use RDS object with many metadata:
+metadata <- readRDS(path.metadata.rds)
+# sort metadata by AK ID (it should be already but just in case)
+metadata <- metadata[ order(metadata$ak_id), ]
+
+# define samples to keep for subtype-specific analysis: 
+# based on 'subtype_final' keep only the 4 subtypes (drop 'exclude' and 'normal'):
+metadata <- metadata[ metadata$subtype_final!="exclude", ]
+metadata <- metadata[ metadata$subtype_final!="normal", ]
+# need to re-level this factor to remove those two levels:
+metadata$subtype_final <- factor(metadata$subtype_final)
+
+# should leave 60 samples with an unambiguous subtype; check:
+message("Number of samples (=rows) / columns in metadata, expected 60 x 32:")
+dim(metadata)
+
+message( "... done!")
+
+
+###########
+#
+# SELECT SAMPLES FOR ANALYSIS
+#
+###########
+# extract the appropriate (HIPO016 samples) counts columns by matching PIDs
+counts.raw <- counts.raw[ , match(metadata$ak_id, colnames(counts.raw)) ]
+
+###########
+#
+# FILTER OUT LOWLY-EXPRESSED TRANSCRIPTS
+#
+###########
+message( "Filtering unexpressed transcripts, plotting row counts per gene...")
+# what's the distribution of counts per gene like?
+#
+# calculate
+counts.per.gene <- rowMeans(counts.raw)
+# plot
+outputname <- paste( output.dir.qc, Sys.Date(), "_01_raw_counts_per_gene.png", sep="")
+png(outputname)
+print( qplot(counts.per.gene, main="Raw counts per gene") )
+dev.off()
+
+# that's incomprehensible! set ylim
+outputname <- paste( output.dir.qc, Sys.Date(), "_02_raw_counts_per_gene_xlim.png", sep="")
+png(outputname)
+qplot(counts.per.gene, main="Raw counts per gene (0-10000)", xlim=c(0, 10000))
+dev.off()
+
+# zoom in further at very low end...
+outputname <- paste( output.dir.qc, Sys.Date(), "_03_raw_counts_per_gene_xlim.png", sep="")
+png(outputname)
+qplot(counts.per.gene, main="Raw counts per gene (0-100)", xlim=c(0, 100))
+dev.off()
+
+message( "... done!")
+
+message( "Setting filter for counts per gene...")
+
+#
+# SET COUNTS FILTER LEVEL
+#
+# try using the previous filter on the whole data set: >10 reads in >6 samples (10% of cohort)
+filter <- apply( counts.raw, 1, function(x) length(x[x>10])>=6)
+counts.filt <- counts.raw[ filter, ]
+
+# print # genes pre- and post-filtering
+pre.filt <- dim(counts.raw)[1]
+post.filt <- dim(counts.filt)[1]
+message( paste("Number of genes pre-filter: ", pre.filt, "; post-filter: ", post.filt, sep="") )
+
+###########
+#
+# DESIGN MATRIX
+#
+###########
+# set up with *4* levels
+
+message( "Setting up design matrix...")
+
+# set up design matrix
+f <- factor(metadata$subtype_final, levels=c("IDH", "MES", "RTK_I", "RTK_II"))
+design <- model.matrix(~0 + metadata$subtype_final)
+colnames(design) <- c("IDH", "MES", "RTK_I", "RTK_II")
+
+
+###########
+#
+# VOOM!
+#
+# Using TMM and also sample quality weights, because we have inequal library sizes - look in dge$samples
+#
+###########
+message( "Running voom...")
+# now use voom to model the raw counts as normal distributions and feed into the limma analysis pipeline
+#
+# as per section 15.3 of limma user's guide
+#
+# need to create a dge object using edgeR
+#library(edgeR)
+dge <- DGEList(counts=counts.filt)
+dge <- calcNormFactors(dge)
+
+message( "Plotting voom TMM and MDS...")
+# apply voom transformation
+# open printing device for voom function's output plot
+outputname <- paste( output.dir.qc, Sys.Date(), "_04_voom_TMM_withSampleWeights_mean_var_plot.png", sep="")
+png(outputname, height=600, width=800)
+# run voom
+voom.tmm <- voomWithQualityWeights( counts=dge, design=design, plot=T )
+dev.off()
+
+# plot MDS with sample labels
+outputname <- paste( output.dir.qc, Sys.Date(), "_05_voom_TMM_withSampleWeights_MDS.png", sep="")
+my.labelled.mds.plot(voom.tmm$E, metadata$ak_id, metadata$subtype_final, outputname, "MDS - voom with TMM and sample quality weights", metadata$ak_id)
+
+
+###########
+#
+# LINEAR MODELLING
+#
+###########
+message( "Fitting linear models to data...")
+# perform linear modelling...
+fit <- lmFit(voom.tmm, design)
+
+###########
+# test for DE genes
+#
+# see section 9.3 of limma user's guide for notes on design and contrast matrices.
+#
+# n.b. use "robust" eBayes fitting due to our weird outliers
+
+# construct contrasts matrix
+# design: compare any subgroup to all others, equally weighted 
+de.contrasts.even <- makeContrasts( IDH-(MES+RTK_I+RTK_II)/3, MES-(IDH+RTK_I+RTK_II)/3, RTK_I-(IDH+MES+RTK_II)/3, RTK_II-(IDH+MES+RTK_I)/3 , levels=design)
+
+message( "eBayes fitting of contrasts to data...")
+
+# then fit again, using robust=T for eBayes fitting
+fit2 <- contrasts.fit(fit, de.contrasts.even)
+fit2 <- eBayes(fit2, robust=T)
+
+#
+# identify significant tests using global (ie all contrasts) BH correction 
+#
+message( "Identifying significant genes...")
+res2 <- decideTests(fit2, method="global", adjust.method="BH", p.value=0.001)
+
+############################################################
+#
+#
+# PLOT VENN DIAGRAMS COMPARING SUBTYPE DEG LISTS
+#
+#
+############################################################
+message( "Plotting Venn diagrams of DEG overlap between contrasts...")
+# plot for res2, pval < 0.001, separate multiple testing correction
+# first: total DEG
+outputname <- paste( output.dir.qc, Sys.Date(), "_06_vennDiagram_subtype_specific_genes_pval_0.001.png", sep="")
+png(outputname, height=1024, width=1024) # 20150416 - increase res to make png nicer
+vennDiagram(res2, main="Subtype-specific genes (voom+TMM+sampleweights) pval < 0.001", names=c("IDH","MES","RTK_I","RTK_II"), cex=c(1.5, 1.2, 1.2))
+dev.off()
+# second: DEG split into up/down
+outputname <- paste( output.dir.qc, Sys.Date(), "_07_vennDiagram_subtype_specific_genes_pval_0.001_includeboth.png", sep="")
+png(outputname, height=1024, width=1024)
+vennDiagram(res2, main="Subtype-specific genes (voom+TMM+sampleweights) pval < 0.001", include=c("up","down"), names=c("IDH","MES","RTK_I","RTK_II"), cex=c(1.5, 1.2, 1.2))
+dev.off()
+# polished version of analysis:
+# output as pdf
+outputname <- paste( output.dir.qc, Sys.Date(), "_07_vennDiagram_subtype_specific_genes_pval_0.001_includeboth_Manuscript.pdf", sep="")
+pdf(outputname, height=5, width=5)
+vennDiagram( res2, 
+            main=NULL, # no title 
+            include=c("up","down"), # split DEG by dynamics 
+            names=c("IDH","MES","RTK_I","RTK_II"),  # names for contrasts
+            circle.col=subtype.colours, # colour contrasts by subtype colours
+            show.include=F, # do not show total #genes in analysis
+            cex=c(0.9, 0.75, 0.75) # change text char size
+           )
+dev.off()
+##########################################################################################
+##########################################################################################
+#
+#
+# EXTRACT SUBTYPE-SPECIFIC GENE LISTS
+#
+#
+##########################################################################################
+##########################################################################################
+
+# using res2 - global hypothesis testing adjustment, FDR<0.001
+message( "Outputting global expression data...")
+# output entire MArrayLM using 'write.fit' https://stat.ethz.ch/pipermail/bioconductor/2006-January/011656.html
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_FDR_0.001.txt", sep="")
+write.fit(fit2, results=res2, file=outputname, adjust="BH", method="global")
+
+# do global adj of pvals and add to output data
+#
+# take pvals adjust globally, then add back in
+#
+# from http://grokbase.com/t/r/bioconductor/127ngqhjkd/bioc-limma-how-to-obtain-p-values-using-method-global-for-multiple-testing
+Global.Adjusted.P <- fit2$p.value
+# gives a single vector of pvals: now adjust
+Global.Adjusted.P <- p.adjust(Global.Adjusted.P, method="BH")
+# this vector corresponds to #genes tested X #contrasts
+# where coef1 = first column of fit2$p.val = the first contrast - e.g. in this analysis, IDH.
+
+message( "Outputting per-subtype DE lists...")
+
+############
+# IDH
+############
+# first: output full set of results, unsorted
+limma.idh <- topTable(fit2, coef=1, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.idh$adj.P.Val <- Global.Adjusted.P[ 1:dim(limma.idh)[1] ]
+
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.idh$ensembl_gene <- sapply(strsplit( rownames(limma.idh) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.idh$hgnc_symbol <- convertIDs( limma.idh$ensembl_gene, "ENSEMBL", "SYMBOL", org.Hs.eg.db)
+# longer gene name
+limma.idh$genename <- convertIDs( limma.idh$ensembl_gene, "ENSEMBL", "GENENAME", org.Hs.eg.db)
+
+# output tab-delim txt
+# full list
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_IDH_DEgenes_FDR_all.txt", sep="")
+write.table(limma.idh, file=outputname, quote=F, sep="\t", row.names=F)
+# at adj pval 0.001
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_IDH_DEgenes_FDR_0.001.txt", sep="")
+write.table(limma.idh[limma.idh$adj.P.Val<0.001,], file=outputname, quote=F, sep="\t", row.names=F)
+
+############
+# MES
+############
+limma.mes <- topTable(fit2, coef=2, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.mes$adj.P.Val <- Global.Adjusted.P[ (1+dim(limma.idh)[1]) : (2*dim(limma.idh)[1]) ]
+
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.mes$ensembl_gene <- sapply(strsplit( rownames(limma.mes) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.mes$hgnc_symbol <- convertIDs( limma.mes$ensembl_gene, "ENSEMBL", "SYMBOL", org.Hs.eg.db)
+# longer gene name
+limma.mes$genename <- convertIDs( limma.mes$ensembl_gene, "ENSEMBL", "GENENAME", org.Hs.eg.db)
+
+# output tab-delim txt
+# full list
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_MES_DEgenes_FDR_all.txt", sep="")
+write.table(limma.mes, file=outputname, quote=F, sep="\t", row.names=F)
+# at adj pval 0.001
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_MES_DEgenes_FDR_0.001.txt", sep="")
+write.table(limma.mes[limma.mes$adj.P.Val<0.001,], file=outputname, quote=F, sep="\t", row.names=F)
+
+############
+# RTK_I
+############
+limma.rtki <- topTable(fit2, coef=3, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.rtki$adj.P.Val <- Global.Adjusted.P[ ( 1 + 2*dim(limma.idh)[1] ) : (3*dim(limma.idh)[1]) ]
+
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.rtki$ensembl_gene <- sapply(strsplit( rownames(limma.rtki) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.rtki$hgnc_symbol <- convertIDs( limma.rtki$ensembl_gene, "ENSEMBL", "SYMBOL", org.Hs.eg.db)
+# longer gene name
+limma.rtki$genename <- convertIDs( limma.rtki$ensembl_gene, "ENSEMBL", "GENENAME", org.Hs.eg.db)
+
+# output tab-delim txt
+# full list
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_RTK_I_DEgenes_FDR_all.txt", sep="")
+write.table(limma.rtki, file=outputname, quote=F, sep="\t", row.names=F)
+# at adj pval 0.001
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_RTK_I_DEgenes_FDR_0.001.txt", sep="")
+write.table(limma.rtki[limma.rtki$adj.P.Val<0.001,], file=outputname, quote=F, sep="\t", row.names=F)
+
+############
+# RTK_II
+############
+limma.rtkii <- topTable(fit2, coef=4, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.rtkii$adj.P.Val <- Global.Adjusted.P[ ( 1 + 3*dim(limma.idh)[1] ) : (4*dim(limma.idh)[1]) ]
+
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.rtkii$ensembl_gene <- sapply(strsplit( rownames(limma.rtkii) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.rtkii$hgnc_symbol <- convertIDs( limma.rtkii$ensembl_gene, "ENSEMBL", "SYMBOL", org.Hs.eg.db)
+# longer gene name
+limma.rtkii$genename <- convertIDs( limma.rtkii$ensembl_gene, "ENSEMBL", "GENENAME", org.Hs.eg.db)
+
+# output tab-delim txt
+# full list
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_RTK_II_DEgenes_FDR_all.txt", sep="")
+write.table(limma.rtkii, file=outputname, quote=F, sep="\t", row.names=F)
+# at adj pval 0.001
+outputname <- paste( output.dir.tab, Sys.Date(), "_limmavoom_DE_analysis_RTK_II_DEgenes_FDR_0.001.txt", sep="")
+write.table(limma.rtkii[limma.rtkii$adj.P.Val<0.001,], file=outputname, quote=F, sep="\t", row.names=F)
+
+
+############################################################
+#
+# PLOT GX VALUE PLOTS FOR TOP 10:
+#	- most sig. (adj p val) DEG
+#	- highest logFC DEG
+#
+# code based on ipynb from 20150311
+#
+############################################################
+# plot for top10 by adjpval
+for ( subtype in c("IDH", "MES", "RTK_I", "RTK_II") )
+	{
+		# define the deg dataframe object based on the 'subtype' variable
+		# then sort by `adj.P.Val` column
+		if ( subtype == "IDH" ) {
+			deg.by.adj.p.val <- limma.idh[ order(limma.idh$adj.P.Val), ]
+		} else if ( subtype == "MES" ) {
+			deg.by.adj.p.val <- limma.mes[ order(limma.mes$adj.P.Val), ]
+		} else if (subtype == "RTK_I" ) {
+			deg.by.adj.p.val <- limma.rtki[ order(limma.rtki$adj.P.Val), ]
+		} else if (subtype == "RTK_II" ) {
+			deg.by.adj.p.val <- limma.rtkii[ order(limma.rtkii$adj.P.Val), ]			
+		}
+		
+		message( paste( "Plotting top 10 DEG (by adj pval) for ", subtype, " subtype...", sep="") )
+		
+		for ( n in 1:10 ) 
+			{		
+				# for n, extract ENSGid from sorted deg dataframe
+				tr.id <- rownames(deg.by.adj.p.val)[n]
+				
+				# also extract name and pval
+				gene <- deg.by.adj.p.val$hgnc_symbol[n]
+				pval <- deg.by.adj.p.val$adj.P.Val[n]
+
+				# logFC
+				logfc <- deg.by.adj.p.val$logFC[n]
+				
+				# extract expression data from voom object
+				gx.values <- voom.tmm$E[ match(tr.id, rownames(voom.tmm$E)), ]
+				
+				# plot
+				outputname <- paste( output.dir.plot, Sys.Date(), "_", subtype, "_DEG_by_adjpval_rank_", n, "_", tr.id, "_", gene, ".pdf", sep="")
+				title <- paste( subtype, " - ", gene, " - ", tr.id, "\np.adj: ", signif(pval,5), " - logFC: ", signif(logfc,5), sep="")
+				pdf(outputname, height=6, width=4)
+				print( qplot(metadata$subtype_final, gx.values, xlab=NULL, ylab="log-cpm", main=title, geom="violin", fill=factor(metadata$subtype_final)) 
+					+ geom_boxplot(width=.1, fill="white", outlier.colour="black") + 
+					scale_fill_manual(values=subtype.colours) + 
+					theme_bw() + theme(legend.position="none", axis.text.x=element_blank(), axis.ticks.x = element_blank()) # drop legend, clean up x-axis tick marks
+					)
+				dev.off()
+			}
+	} 
+
+# plot for top10 by logFC
+for ( subtype in c("IDH", "MES", "RTK_I", "RTK_II") )
+	{
+		# define the deg dataframe object based on the 'subtype' variable
+		# get DEG with adj pval < 0.001
+		# then sort by `logFC` column in decreasing order
+		if ( subtype == "IDH" ) {
+			deg.by.logfc <- limma.idh[ limma.idh$adj.P.Val<0.001, ]
+			deg.by.logfc <- deg.by.logfc[ order(deg.by.logfc$logFC, decreasing=T), ]
+		} else if ( subtype == "MES" ) {
+			deg.by.logfc <- limma.mes[ limma.mes$adj.P.Val<0.001, ]			
+			deg.by.logfc <- deg.by.logfc[ order(deg.by.logfc$logFC, decreasing=T), ]
+		} else if (subtype == "RTK_I" ) {
+			deg.by.logfc <- limma.rtki[ limma.rtki$adj.P.Val<0.001, ]			
+			deg.by.logfc <- deg.by.logfc[ order(deg.by.logfc$logFC, decreasing=T), ]
+		} else if (subtype == "RTK_II" ) {
+			deg.by.logfc <- limma.rtkii[ limma.rtkii$adj.P.Val<0.001, ]			
+			deg.by.logfc <- deg.by.logfc[ order(deg.by.logfc$logFC, decreasing=T), ]
+		}
+		
+		message( paste( "Plotting top 10 DEG (by logFC) for ", subtype, " subtype...", sep="") )
+		
+		for ( n in 1:10 ) 
+			{		
+				# for n, extract ENSGid from sorted deg dataframe
+				tr.id <- rownames(deg.by.logfc)[n]
+				
+				# also extract name and pval
+				gene <- deg.by.logfc$hgnc_symbol[n]
+				pval <- deg.by.logfc$adj.P.Val[n]
+				
+				# logFC
+				logfc <- deg.by.logfc$logFC[n]
+				
+				# extract expression data from voom object
+				gx.values <- voom.tmm$E[ match(tr.id, rownames(voom.tmm$E)), ]
+				
+				# plot
+				outputname <- paste( output.dir.plot, Sys.Date(), "_", subtype, "_DEG_by_logFC_rank_", n, "_", tr.id, "_", gene, ".pdf", sep="")
+				title <- paste( subtype, " - ", gene, " - ", tr.id, "\np.adj: ", signif(pval,5), " - logFC: ", signif(logfc,5), sep="")
+				pdf(outputname, height=6, width=4)
+				print( qplot(metadata$subtype_final, gx.values, xlab=NULL, ylab="log-cpm", main=title, geom="violin", fill=factor(metadata$subtype_final)) 
+					+ geom_boxplot(width=.1, fill="white", outlier.colour="black") + 
+					scale_fill_manual(values=subtype.colours) + 
+					theme_bw() + theme(legend.position="none", axis.text.x=element_blank(), axis.ticks.x = element_blank()) # drop legend, clean up x-axis tick marks
+					)
+				dev.off()
+			}
+	} 
+
+############################################################
+#
+#
+# PERFORM MDS ON DEG ONLY
+# 20150416 
+# code based on ipynb from 20150402
+#
+#
+############################################################
+message( "Re-plotting MDS using DEG only...")
+
+# get rownames for each limma.SUBTYPE object with adj pval < 0.001
+#  i.e. the ENSG IDs for the DEG
+deg.ids <- unique( c( rownames(limma.idh[limma.idh$adj.P.Val<0.001,]), rownames(limma.mes[limma.mes$adj.P.Val<0.001,]), 
+	rownames(limma.rtki[limma.rtki$adj.P.Val<0.001,]), rownames(limma.rtkii[limma.rtkii$adj.P.Val<0.001,]) ))
+
+# extract gx values
+deg.gx <- voom.tmm$E[ match( deg.ids, rownames(voom.tmm$E) ), ]
+
+# plot
+outputname <- paste( output.dir.qc, Sys.Date(), "_08_voom_TMM_withSampleWeights_MDS_on_DEG.png", sep="")
+my.labelled.mds.plot(deg.gx, metadata$ak_id, metadata$subtype_final, outputname, "MDS - voom with TMM norm and sample quality weights\nUsing all DEG (adj. p-val < 0.001)", metadata$ak_id)
+
+# for manuscript:
+# plot
+outputname <- paste( output.dir.qc, Sys.Date(), "_08_voom_TMM_withSampleWeights_MDS_on_DEG_Manuscript.png", sep="")
+my.mds.plot(deg.gx, metadata$ak_id, metadata$subtype_final, outputname, "MDS - voom with TMM norm and sample quality weights\nUsing all DEG (adj. p-val < 0.001)")
+
+############################################################
+############################################################
+#
+#
+# SAVE COPY OF SESSION INFO AND R ENVIRONMENT (to return to for later analyses if needed)
+#
+# also save copies of the processed voom.tmm object (with GX values)
+# and metadata - useful for downstream analyses...
+#
+############################################################
+############################################################
+message("Saving voom expression object and metadata table...")
+outputname <- paste( output.dir.objs, Sys.Date(), "_limmavoom_analysis_ResObj.Rdata", sep="" )
+save( voom.tmm, metadata, file=outputname )
+
+message( "Saving session info and copy of R environ...")
+# session info
+seshinf <- paste ( output.dir.objs, Sys.Date(), "_pipeline_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)
+
+# Renv
+outputname <- paste( output.dir.objs, Sys.Date(), "_pipeline_end_Renv.Rdata", sep="")
+save.image(file=outputname)
