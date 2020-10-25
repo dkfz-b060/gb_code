@@ -1,13 +1,28 @@
-#!/bin/R-3.4.2
+#!/bin/R
+
+########################################
 #
 # gbm_hipo016_common.R
 #
-# 20171219
+# Mike Fletcher
+# 20201025
+#
+# R version used: both 3.4.3 and 3.5.1
+#
+# (original name: gbm_hipo016_common.R)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
 #
 # Common R code for the HIPO016 GBM analysis:
 # - definitions for the analysis (e.g. paths)
 # - functions that are reused throughout the code
 #
+########################################
+
 ####################################################################################################
 #
 # DEFINITIONS
@@ -18,10 +33,6 @@ message( "\nLoading common code for HIPO016 analysis...\n")
 
 # set library paths: use personal lib first, then R-bundle, then R
 .libPaths(new=.libPaths()[c(2,1,3)])
-# which returns:
-#[1] "/home/fletcher/R/x86_64-pc-linux-gnu-library/3.4"
-#[2] "/b06x/cluster/42.2/x86_64/easybuild/software/R-bundle/20171215-foss-2017a-R-3.4.3"
-#[3] "/b06x/cluster/42.2/x86_64/easybuild/software/R/3.4.3-foss-2017a/lib64/R/library"
 
 ################
 # data:
@@ -30,6 +41,7 @@ message( "\nLoading common code for HIPO016 analysis...\n")
 path.metadata.rds <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/resources_mike/HIPO016_GBM_subtyping_20190804.rds"
 
 # location of Zuguang's processed RNAseq matrices
+# contains Gencode v19 genes as rows, samples as columns
 path.rnaseq.matrix <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/WGBS_final_cohort/expression/hipo16_rnaseq_count_rpkm.RData"
 
 # location of limma analysis dir (non-datestamped, created by subtype_genes_limma.Rscript)
@@ -38,10 +50,8 @@ path.limma.analysis <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/RNAseq_su
 # define path to the by-sample-id basedir for the ChIPseq data:
 path.chipseq <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/chipseq_newAlignments/wgs_bowtie/" 
 
-# path to limma Renv (see ipynb 20171219) - updated for AK088 rerun
+# path to limma Renv
 limma.renv <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/RNAseq_subtype_genes/R_objects/2019-08-04_pipeline_end_Renv.Rdata"
-# CIMPneg Renv from same analysis - for AK088 rerun, not needed
-#limma.cimpneg.renv <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/RNAseq_subtype_genes/R_objects/2017-12-19_CIMPneg_pipeline_end_Renv.Rdata"
 
 # path to (minCov2) subtype enhancer dir with per-subtype .bed files:
 path.enh.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/cluster_enh/subtypeEnhancers/output/"

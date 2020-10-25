@@ -1,0 +1,324 @@
+#!/bin/R-3.4.3
+
+########################################
+#
+# methylation_clustering_all_tumours_sfig1a.Rscript
+#
+# Mike Fletcher
+# 20201025
+#
+# R version used: 3.4.3
+#
+# (original name: 450k_EPIC_clustering.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# using 450k/EPIC methylation array data for the patient tumours (n=60)
+# cluster for subtypes using the method in the Sturm et al. 2012 paper, adapted here:
+#	1) take the 8000 450k probes and overlap with the probes available in our combined 450k/EPIC dataset (n=7386)
+#	2) calculate Euclidean distance
+#	3) cluster with Ward.D linkage 
+#
+# Also plots a extra annotation information (CNAs, GX, mutations) for the tumour samples.
+#
+########################################
+# INPUTS
+########################################
+#
+#	- combined_GBM_subtyping_FINAL_20170120.csv
+#		sample sheet for the GBMs containing IDAT filenames, and also annotation data
+#		published as Supplementary Table 1 (GB Patient Data)
+#	- tumour sample methylation beta values
+#		these processed values have been uploaded to the GEO:
+#		https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE121722
+#	- 20170118_volker_hccpgs_order.txt
+#		the list of 8000 probes used by Volker
+#		published as Supplementary Data 6 (methylation probe IDs)
+#
+# These should be put in the clustering analysis dir: /icgc/dkfzlsdf/analysis/hipo/hipo_016/cluster_450k/
+#
+########################################
+# OUTPUTS
+########################################
+#
+# SUPPLEMENTARY FIGURE 1a:
+# - heatmap of the methylation for the tumour samples, annotated with sample information (though this is removed from the published figure) (.pdf)
+#
+# - R environment (.Rdata) and session information (.txt)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# no special resource requirements - note that the full tumour methylation matrix is large (~450k x 60)
+# 
+########################################
+
+######################################
+#
+# SETUP - set output dir
+#
+######################################
+# define cluster analysis basedir:
+clustering.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/cluster_450k/"
+
+# define + create output directory
+outputdir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/methylation_array_subtyping/"
+system2("mkdir", args=outputdir)
+# work in this dir
+setwd(outputdir)
+
+###################
+#
+# LOAD LIBRARIES
+#
+###################
+suppressMessages( library(minfi) )
+suppressMessages( library(ggplot2) )
+suppressMessages( library(IlluminaHumanMethylation450kanno.ilmn12.hg19) )
+suppressMessages( library(IlluminaHumanMethylation450kmanifest) )
+# load ComplexHeatmap lib
+suppressMessages( library(ComplexHeatmap) )
+# heatmap colours for methylation: use blue-white-red scale, 0-100
+suppressMessages( library(marray) )
+cols <- colorRampPalette(c("blue", "white", "red"))(100)
+# pass to 'col' in heatmap function
+
+# need to do this otherwise can't load the per-sample .Rdata files
+options(stringsAsFactors = FALSE)
+
+# load common HIPO016 code
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")
+
+######################################
+#
+# LOAD DATA
+# DON'T USE MINFI!
+#
+# HERE: you need a vector of paths to the data to be loaded (see "load data!" below)
+#
+######################################
+# load metadata: get only the 60 clearly subtyped samples
+# use RDS object with many metadata:
+metadata <- readRDS(path.metadata.rds)
+# sort metadata by AK ID (it should be already but just in case)
+metadata <- metadata[ order(metadata$ak_id), ]
+# define samples to keep for subtype-specific analysis: 
+# based on 'subtype_final' keep only the 4 subtypes (drop 'exclude' and 'normal'):
+metadata <- metadata[ metadata$subtype_final!="exclude", ]
+metadata <- metadata[ metadata$subtype_final!="normal", ]
+# need to re-level this factor to remove those two levels:
+metadata$subtype_final <- factor(metadata$subtype_final)
+
+# read in sample sheet
+# copied into the output dir for today's analysis also
+# don't use minfi; build basenames on our own below 
+targets <- read.csv( file=paste( clustering.dir, "HIPO016_GBM_subtyping_FINAL_20170120.csv", sep="/") )
+
+# take only the samples that are present in the filtered metadata set:
+targets <- targets[ match(metadata$ak_id, targets$ak_id), ]
+
+# also rename the "targets" metadata to "pd" to feed into the code from the script
+pd <- targets
+
+# load the pre-processed per-sample Rdata files
+# have to build my own paths:
+array.db <- "/b06x-lsdf/IlmnArrayDB/minfi2/" # dir with per-array folders (Sentrix ID)
+# paste together array db, then the $idat column from the read-in samplesheet, split for array Id and then the filename
+basenames <- paste( array.db, unlist( strsplit( x=targets$idat, split="_" ) )[ seq(from=1,by=2,to=dim(targets)[1]*2) ], "/", targets$idat, ".RData", sep="")
+
+######################################
+#
+# GET VOLKER'S PROBE LIST AND EXTRACT MATCHING ROWS 
+#
+######################################
+#### read in Volker's probe list
+# it's in the cluster analysis dir...
+volker.probes <- read.table( file=paste( clustering.dir, "20170118_volker_hccpgs_order.txt", sep="/"), header=F, sep="\t", colClasses="character")$V1
+
+##########################################################################################
+# load data!
+# return as list
+# each of the list members has "Mset" obj; so in turn load each sample, get the rows with probeID matching the Volker list 
+betas.list <- lapply( X=basenames, FUN= function(sample)
+                  {
+                    message(sample)
+                    load(sample)
+                    betas <- getBeta( Mset, type="Illumina" )[ rownames(Mset) %in% volker.probes, ]
+                    return(betas)
+                  }
+               )
+# returns a list of vectors (= beta values) with names (=probeIDs)
+# #probes differs depending on whether you have 450k or EPIC 
+
+# so now: create 2 dfs, one for each array platform
+dat.epic <- do.call( cbind, betas.list[ pd$array_type == "IlluminaHumanMethylationEPIC" ] )
+dat.450k <- do.call( cbind, betas.list[ pd$array_type == "IlluminaHumanMethylation450k" ] )
+# add IDs from pd
+colnames(dat.epic) <- pd$ak_id[ pd$array_type == "IlluminaHumanMethylationEPIC" ]
+colnames(dat.450k) <- pd$ak_id[ pd$array_type == "IlluminaHumanMethylation450k" ]
+
+# and then merge these two by row names:
+dat <- merge( dat.epic, dat.450k, by="row.names" )
+
+# tidy up df: move Row.names column to actual rownames and drop it
+rownames(dat) <- dat$Row.names
+dat <- dat[ , !(colnames(dat) %in% "Row.names") ]
+# reorder by colnames also:
+dat <- dat [, order( colnames(dat) ) ]
+
+# sanity check: 
+dim(dat)
+# should give 7386 rows (overlap of subtyping probes on the 450k/EPIC arrays)
+
+# remove list after use
+rm(betas.list)
+
+###################
+#
+# CLUSTER
+#
+###################
+##############
+# SAMPLE SELECTION:
+# drop all non-HIPO016 samples - i.e.
+# without a HIPO ID = "unseq", filtered = "drop" or controls "normal_control" 
+samples.drop <- (pd$hipo_id=="unseq" | pd$hipo_id=="drop" )
+# update pd df (to generate ColSideColours for heatmap, see below)
+pd.dropped <- pd[ !(samples.drop),  ]
+
+#############################
+# cluster
+# subset the volker probe df based on the samples wanted
+dat.filt <- dat[ , !(samples.drop) ]
+
+# sanity check
+dim(dat.filt)
+# should give 7386 probes x 60 samples
+
+###################
+#
+# USE WARD.D LINKAGE FOR CLUSTERING + EUCLIDEAN AS DISTANCE
+# as used by Volker in Dominik's 2012 paper
+#
+###################
+hclust.method <- "ward.D"
+
+message( "Calculating distances for clustering..." )
+
+# calculate distances of columns - work on transverse of dat.filt
+dat.dist <- dist( t(dat.filt) )
+# cluster based on distance matrix
+dat.clust <- as.dendrogram( hclust( dat.dist, method=hclust.method ) )
+
+# cluster based on rows = probes
+row.dist <- dist( dat.filt )
+row.clust <- as.dendrogram( hclust( row.dist, method=hclust.method ) )
+
+###################
+#
+# PLOT + GENERATE OUTPUTS
+#
+###################
+message( "Generating output plots..." )
+
+# generate title with extra info
+title <- paste("Hierarchical clustering of n=", dim(dat.filt)[2], " HIPO016 GBM samples (methylation array data)\n", 
+	dim(dat.filt)[1], " probes from Sturm et al. (2012) common to 450k and EPIC platforms; Euclidean distance, hclust method: ", hclust.method, sep="")
+
+# generate heatmap annotations:
+# define as input df the subtype cols from pd
+# here "subtype_final" refers to, yes, our final subtype
+predicted.subtypes <- pd.dropped[,"subtype_final"]
+
+# for colours: see below. pass a list, for each column in predicted.subtypes a vector mapping subtype->colour:
+ha <- ComplexHeatmap::HeatmapAnnotation( 
+    df=data.frame(subtype=predicted.subtypes),
+    col=list(
+    subtype=c( "MES"="#377eb8", "RTK_I"="#4daf4a", 
+			"RTK_II"="#984ea3", "IDH"="#e41a1c", "exclude"="black" )
+							 ),
+    na_col="black", show_annotation_name=TRUE, show_legend=TRUE
+ )
+ 
+# next: do CNAs/muts
+# subset pd df for the columns of interest = 7-20
+cnas.muts.gx <- pd.dropped[,7:20]
+# add rownames
+rownames(cnas.muts.gx) <- pd.dropped$ak_id
+
+# generate heatmap anno:
+#
+# use as input annotations df with CNAs/mutations/GX/ESTIMATE scores/ssGSEA scores
+# show legends - logical vector - based on df column order
+#
+# for age map to heatmap scale white->red
+# for gender map male to blue, female to red
+# for focal annos with scores "normal" or "amp/del" map to white,black
+# for annos with scores "normal","gain"/"loss" map to white,black
+# for muts map as described
+ha.bottom <- ComplexHeatmap::HeatmapAnnotation( 
+    df=cnas.muts.gx,
+	show_legend = c(TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE ),
+    col=list(
+		age=circlize::colorRamp2( c( min(cnas.muts.gx$age), max(cnas.muts.gx$age) ), c("white", "red") ),
+		gender=c("m"="blue", "f"="red"),
+		chr7gain=c("normal"="white", "gain"="black"),
+		chr10loss=c("normal"="white", "loss"="black"),
+		chr19gain=c("normal"="white", "gain"="black"),	
+		chr20gain=c("normal"="white", "gain"="black"),	
+		mutIDH1_2=c("wt"="white", "mut"="red", "R132H"="red"),
+		mutTP53=c("wt"="white", "mut"="red"),
+		ampEGFR=c("normal"="white", "amp"="black"),		
+		ampPDGFRA=c("normal"="white", "amp"="black"),		
+		delCDKN2A_B=c("normal"="white", "del"="black"),		
+		ampCDK4=c("normal"="white", "amp"="black"),		
+		delRB1=c("normal"="white", "del"="black"),	
+		ampMET=c("normal"="white", "amp"="black") 
+	),
+    na_col="grey", show_annotation_name=TRUE        
+ )
+
+# FINALLY: we can plot the cheeky beggar
+# generate Heatmap() object...
+#
+# options:
+# use as input matrix feature df, coerced to matrix
+# col = cols (defined in setup)
+# column_title = title defined above
+# name = heatmap name (used in legend)
+# row_title = title of rows (description of what's the rows, ofc)
+# cluster_rows and cluster_columns - self explanatory, use dendros from above
+# don't show row/col names (too many!)
+# for top annotation use generated above
+hm <- ComplexHeatmap::Heatmap( matrix=as.matrix(dat.filt), col=cols, 
+  column_title=title, name="Methylation (beta)", row_title=paste( dim(dat.filt)[1], "probes" ),
+  cluster_rows=row.clust, cluster_columns=dat.clust, show_row_names=FALSE, show_column_names=TRUE,
+  top_annotation=ha, bottom_annotation=ha.bottom )
+        
+# output...
+pdf( paste( Sys.Date(), "_450k_EPIC_GBM_subtype_clustering_HIPO016_cancer_samples_Volker_probes_WardD_Euclidean.pdf", sep=""), width=15, height=17)
+# move heatmap legend (beta scale) to right
+# move subtype prediction legend to left
+# add padding to bottom/left/top/right hand side
+ComplexHeatmap::draw( hm, heatmap_legend_side = "right", annotation_legend_side = "left", padding=unit(c(1,1,1,2), "cm") )
+dev.off()
+
+######################################
+#
+# save copy of Renv for later use if needed; also save session info
+#
+######################################
+# save Renv:
+save.image(file=paste(Sys.Date(), "_methylation_clustering_end_Renv.Rdata", sep=""))
+
+message( "Saving copy of session info and Renv..." )
+# output session info
+seshinf <- paste ( Sys.Date(), "_450K_EPIC_GBM_clustering_sessionInfo.txt", sep="" )
+writeLines( capture.output(sessionInfo()), seshinf )
+
+message( "Finished!" )
