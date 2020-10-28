@@ -1,0 +1,338 @@
+#!/bin/R-3.4.3
+
+########################################
+#
+# rtn_analysis_03_cohort_comparison_sfig3.Rscript
+#
+# Mike Fletcher
+# 20201028
+#
+# R version used: 3.4.3
+#
+# (original name: gbm_rtn_analysis_04_cohort_comparison.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# RTN gene regulatory network analysis of GBMs using GX microarray data
+# Comparison of the two microarray cohorts, A and B
+#
+# n.b. "consensus" MRs here mean MRs identified as significant in the 2-tail GSEA in both
+# the test and validation cohorts
+#
+#	script that compares the significant MR calls (adj pval < 0.01)
+#	in the two cohorts of GX array data, A and B
+#
+########################################
+# INPUTS
+########################################
+#
+# loads the saved Renv from the end of rtn_analysis_01_run_rtn.Rscript
+#
+########################################
+# OUTPUTS
+########################################
+#
+# SUPPLEMENTARY FIGURE 3:
+#	1. Venn diagram showing overlap of MR calls between A and B (SFig 3c, .pdf)
+#	2. per-subtype: correlation plots showing the dES in A and B, for common TFs (SFig 3b, .pdf)
+#
+# also saves the newly-generated objects (.Rdata) and the session information (.txt) 
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# you will need to load the (large) saved RTN Renv, but otherwise this is a basic plotting script 
+# (no heavy computation needed - we're not permuting the GSEAs, as we just want enrichment scores and not pvals)
+#
+########################################
+
+####################
+#
+# SETUP
+# working dir, load libs, load data...
+#
+####################
+#
+# source common code for the GBM RTN analysis: 
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+#
+# load libraries
+suppressMessages( library(RTN) )
+suppressMessages( library(ggplot2) )
+# heatmap colours
+suppressMessages( library(marray) )
+# load libraries for Zuguang's EnrichedHeatmap package
+suppressMessages( library(ComplexHeatmap) )
+suppressMessages( library(circlize) )
+suppressMessages( library(EnrichedHeatmap) )
+suppressMessages( library(GetoptLong) )
+
+# load saved Renv from end of rtn script:
+load(list.files()[ grep( x=list.files(), pattern="_combined_GBM_RTN_Renv.Rdata" ) ])
+
+# re-source common code for the GBM RTN analysis (in case load Renv loads old code)
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+
+# create new output dir for this script:
+system2("mkdir", "./res_cohort_comparison/")
+
+####################
+#
+# generate Venn diagram showing overlap of sig. MRs across networks:
+#
+####################
+# first find the TFs appearing in both network analyses:
+#
+# get list of TFs appearing in both networks
+common.tfs <- intersect( names( tni.get( rtni.test, what="regulatoryElements" ) ), names( tni.get( rtni.validation, what="regulatoryElements" ) ) )
+
+# now for each subtype (4-subtype analysis):
+# calculate the ES scores
+# set no pvalcutoff, don't step filter, specify tfs as above
+tfs.idh.test <- tna.gsea2( rtna.idh.test, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+tfs.mes.test <- tna.gsea2( rtna.mes.test, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+tfs.rtki.test <- tna.gsea2( rtna.rtki.test, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+tfs.rtkii.test <- tna.gsea2( rtna.rtkii.test, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+tfs.idh.validation <- tna.gsea2( rtna.idh.validation, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+tfs.mes.validation <- tna.gsea2( rtna.mes.validation, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+tfs.rtki.validation <- tna.gsea2( rtna.rtki.validation, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+tfs.rtkii.validation <- tna.gsea2( rtna.rtkii.validation, pValueCutoff=1, tfs=common.tfs, nPermutations=1 )
+
+# redefine common tfs again based on $Regulon in GSEA2 results df
+# because filtering occurs!
+common.tfs <- intersect( tfs.idh.test@results$GSEA2.results$differential$Regulon, tfs.idh.validation@results$GSEA2.results$differential$Regulon )
+ 
+# next: find the symbols of MRs that are significant in networks A and B, across all subtypes
+# do this for positive/negative separately, then recombine before generating Venn of A/B overlap:
+tfs.test <- unique( c(
+	rtna.idh.test@results$GSEA2.results$differential$Regulon[rtna.idh.test@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01],
+	rtna.mes.test@results$GSEA2.results$differential$Regulon[rtna.mes.test@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01],
+	rtna.rtki.test@results$GSEA2.results$differential$Regulon[rtna.rtki.test@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01],
+	rtna.rtkii.test@results$GSEA2.results$differential$Regulon[rtna.rtkii.test@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01]
+	) )
+tfs.validation <- unique( c(
+	rtna.idh.validation@results$GSEA2.results$differential$Regulon[rtna.idh.validation@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01],
+	rtna.mes.validation@results$GSEA2.results$differential$Regulon[rtna.mes.validation@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01],
+	rtna.rtki.validation@results$GSEA2.results$differential$Regulon[rtna.rtki.validation@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01],
+	rtna.rtkii.validation@results$GSEA2.results$differential$Regulon[rtna.rtkii.validation@results$GSEA2.results$differential$Adjusted.Pvalue < 0.01]
+	) )
+	
+# generate venn: first, generate matrix to pass to limma::vennCount
+#
+# build df with TF names from all TFs:
+mat.olap.venn <- data.frame( tf=common.tfs )
+# populate test and validation columns based on matching symbols
+mat.olap.venn$test <- mat.olap.venn$tf %in% tfs.test
+mat.olap.venn$validation <- mat.olap.venn$tf %in% tfs.validation
+# coerce T/F to 0,1 and pass the appropriate cols to vennCount
+mat.olap.venn[mat.olap.venn==TRUE] <- as.numeric(1)
+mat.olap.venn.counts <- vennCounts(x=mat.olap.venn[,c(2:3)])
+
+# generate output venn diagram:
+outputname <- paste0( "./res_cohort_comparison/", Sys.Date(), "_cohort_comparison_MR_overlap_Venn.pdf" )
+pdf(outputname, height=5, width=5)
+# use vennCounts output matrix
+# pass as names of sectors network A/B
+# change text size
+# colour circles
+# change margins around plot
+# add title, change title font size
+# change font face
+vennDiagram( mat.olap.venn.counts, names=c("Network A", "Network B"), cex=c(1,1,1), circle.col=c("yellow", "green"),
+	mar=rep(0.01,4), 
+	main="\n\n\n\nOverlap of significant MRs\n(any subtype, adj. p-value < 0.01)", cex.main=1)
+dev.off()
+
+####################
+#
+# generate correlation plots showing dES scores in both networks
+#
+# do for common TFs (i.e. that appear in both networks)
+#
+####################
+# for each subtype/network:
+# extract columns containing regulon and observed dES
+tfs.idh.test <- tfs.idh.test@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+tfs.idh.validation <- tfs.idh.validation@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+tfs.mes.test <- tfs.mes.test@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+tfs.mes.validation <- tfs.mes.validation@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+tfs.rtki.test <- tfs.rtki.test@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+tfs.rtki.validation <- tfs.rtki.validation@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+tfs.rtkii.test <- tfs.rtkii.test@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+tfs.rtkii.validation <- tfs.rtkii.validation@results$GSEA2.results$differential[common.tfs, c("Regulon", "Observed.Score") ]
+
+# combine into single df for plotting
+# merge on "Regulon" column
+tfs.idh <- merge( tfs.idh.test, tfs.idh.validation, by="Regulon" )
+tfs.mes <- merge( tfs.mes.test, tfs.mes.validation, by="Regulon" )
+tfs.rtki <- merge( tfs.rtki.test, tfs.rtki.validation, by="Regulon" )
+tfs.rtkii <- merge( tfs.rtkii.test, tfs.rtkii.validation, by="Regulon" )
+
+# change column names
+colnames(tfs.idh) <- c("Regulon", "test", "validation" )
+colnames(tfs.mes) <- c("Regulon", "test", "validation" )
+colnames(tfs.rtki) <- c("Regulon", "test", "validation" )
+colnames(tfs.rtkii) <- c("Regulon", "test", "validation" )
+
+# now:
+# for each subtype: 
+# get consensus MRs; add columns to that df for significance (to colour points) and the name (to add labels to plot)
+# match based on TF names; remove non-significant MRs 
+#
+# do for IDH:
+tfs.idh$Label <- tfs.idh$Regulon
+tfs.idh$Label[ !(tfs.idh$Label %in% get.consensus.mrs( rtna.idh.test, rtna.idh.validation )) ] <- NA
+tfs.idh$significant <- NA
+tfs.idh$significant[ !is.na(tfs.idh$Label) ] <- "significant"
+tfs.idh$significant[ is.na(tfs.idh$Label) ] <- "nonsignificant"
+# MES:
+tfs.mes$Label <- tfs.mes$Regulon
+tfs.mes$Label[ !(tfs.mes$Label %in% get.consensus.mrs( rtna.mes.test, rtna.mes.validation )) ] <- NA
+tfs.mes$significant <- NA
+tfs.mes$significant[ !is.na(tfs.mes$Label) ] <- "significant"
+tfs.mes$significant[ is.na(tfs.mes$Label) ] <- "nonsignificant"
+# RTK_I
+tfs.rtki$Label <- tfs.rtki$Regulon
+tfs.rtki$Label[ !(tfs.rtki$Label %in% get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation )) ] <- NA
+tfs.rtki$significant <- NA
+tfs.rtki$significant[ !is.na(tfs.rtki$Label) ] <- "significant"
+tfs.rtki$significant[ is.na(tfs.rtki$Label) ] <- "nonsignificant"
+# RTK_II
+tfs.rtkii$Label <- tfs.rtkii$Regulon
+tfs.rtkii$Label[ !(tfs.rtkii$Label %in% get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )) ] <- NA
+tfs.rtkii$significant <- NA
+tfs.rtkii$significant[ !is.na(tfs.rtkii$Label) ] <- "significant"
+tfs.rtkii$significant[ is.na(tfs.rtkii$Label) ] <- "nonsignificant"
+
+# finally: calculate spearman rank correlations for each subtype
+# do to 3 sf
+idh.cor <- signif( cor( x=tfs.idh$test, y=tfs.idh$validation, method="spearman" ), 3)
+mes.cor <- signif( cor( x=tfs.mes$test, y=tfs.mes$validation, method="spearman" ), 3)
+rtki.cor <- signif( cor( x=tfs.rtki$test, y=tfs.rtki$validation, method="spearman" ), 3)
+rtkii.cor <- signif( cor( x=tfs.rtkii$test, y=tfs.rtkii$validation, method="spearman" ), 3)
+
+# plot for each subtype:
+# IDH
+outputname <- paste0( "./res_cohort_comparison/", Sys.Date(), "_cohort_comparison_IDH.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot( tfs.idh, aes(x=test, y=validation, colour=significant) ) + # x/y values = dES scores, colour by 'significant'
+geom_point() + # scatter plot
+scale_colour_manual( values=c( nonsignificant="#888888", significant="#e41a1c" ) ) + # set point colour manually
+geom_rug(position="jitter", size=.1) + # add marginal rug marks to show distribution of values
+labs( x="2-tail GSEA dES (test network)", y="2-tail GSEA dES (validation network)" ) +
+ggtitle( paste0( "Comparison of networks A and B\nSubtype: IDH\nSpearman's rank correlation:", idh.cor ) )
+dev.off()
+# MES
+outputname <- paste0( "./res_cohort_comparison/", Sys.Date(), "_cohort_comparison_MES.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot( tfs.mes, aes(x=test, y=validation, colour=significant) ) + # x/y values = dES scores, colour by 'significant'
+geom_point() + # scatter plot
+scale_colour_manual( values=c( nonsignificant="#888888", significant="#377eb8" ) ) + # set point colour manually
+geom_rug(position="jitter", size=.1) + # add marginal rug marks to show distribution of values
+labs( x="2-tail GSEA dES (test network)", y="2-tail GSEA dES (validation network)" ) +
+ggtitle( paste0( "Comparison of networks A and B\nSubtype: MES\nSpearman's rank correlation:", mes.cor ) )
+dev.off()
+# RTK_I
+outputname <- paste0( "./res_cohort_comparison/", Sys.Date(), "_cohort_comparison_RTK_I.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot( tfs.rtki, aes(x=test, y=validation, colour=significant) ) + # x/y values = dES scores, colour by 'significant'
+geom_point() + # scatter plot
+scale_colour_manual( values=c( nonsignificant="#888888", significant="#4daf4a" ) ) + # set point colour manually
+geom_rug(position="jitter", size=.1) + # add marginal rug marks to show distribution of values
+labs( x="2-tail GSEA dES (test network)", y="2-tail GSEA dES (validation network)" ) +
+ggtitle( paste0( "Comparison of networks A and B\nSubtype: RTK_I\nSpearman's rank correlation:", rtki.cor ) )
+dev.off()
+# RTK_I
+outputname <- paste0( "./res_cohort_comparison/", Sys.Date(), "_cohort_comparison_RTK_II.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot( tfs.rtkii, aes(x=test, y=validation, colour=significant) ) + # x/y values = dES scores, colour by 'significant'
+geom_point() + # scatter plot
+scale_colour_manual( values=c( nonsignificant="#888888", significant="#984ea3" ) ) + # set point colour manually
+geom_rug(position="jitter", size=.1) + # add marginal rug marks to show distribution of values
+labs( x="2-tail GSEA dES (test network)", y="2-tail GSEA dES (validation network)" ) +
+ggtitle( paste0( "Comparison of networks A and B\nSubtype: RTK_II\nSpearman's rank correlation:", rtkii.cor ) )
+dev.off()
+
+#############################################
+#
+# generate publication quality plot of the above correlation plots:
+#
+# do as single ggplot; build plot data frame and then tweak graphical outputs
+#
+#############################################
+# build plot dataframe: combine per-subtype dfs with extra subtype column
+plot.data <- rbind(
+	cbind( tfs.idh, subtype=rep("IDH", nrow(tfs.idh)) ),
+	cbind( tfs.mes, subtype=rep("MES", nrow(tfs.mes)) ),
+	cbind( tfs.rtki, subtype=rep("RTK_I", nrow(tfs.rtki)) ),
+	cbind( tfs.rtkii, subtype=rep("RTK_II", nrow(tfs.rtkii)) )
+	)
+# to colour each significant point by subtype, 
+# need a new factor based on combining subtype + significance:
+plot.data$sig.subtype <- paste( plot.data$subtype, plot.data$significant, sep="_" )
+# and fill nonsignificant cells with "nonsignificant"
+plot.data$sig.subtype[ plot.data$significant=="nonsignificant" ] <- "nonsignificant"
+
+# build text anno df with Spearman corrs of dES:
+# build with: facet names (to match plot.data), correlation as labels, x/y coords
+plot.text <- data.frame(
+	subtype=levels(plot.data$subtype),
+	label=as.character( c(idh.cor, mes.cor, rtki.cor, rtkii.cor) ),
+	x=-1,
+	y=1.25
+	)
+
+# manually define values for point colour here:
+# map to standard subtype colours
+col.scale <- c( nonsignificant="#888888", IDH_significant=subtype.colours["IDH"], MES_significant=subtype.colours["MES"],
+	RTK_I_significant=subtype.colours["RTK_I"], RTK_II_significant=subtype.colours["RTK_II"] )
+# fix names:
+names(col.scale) <- c("nonsignificant", "IDH_significant", "MES_significant", "RTK_I_significant", "RTK_II_significant")	
+	
+# plot:
+# generate plot object:
+# plot x = test dES, y = validation dES as scatter plot (geom_point) with colour mapping to the sig.subtype factor above
+# facet_wrap subtypes, in 2 rows
+p <- ggplot( plot.data, aes(x=test, y=validation ) ) + geom_point(aes(colour=sig.subtype)) + facet_wrap(~subtype, nrow=2) +
+scale_colour_manual( values=col.scale ) + # set point colour manually based on sig.subtype levels
+geom_rug(aes(colour=sig.subtype), position="jitter", size=.1) + # add coloured marginal rug marks to show distribution of values
+labs( x="2-tail GSEA dES (Network A)", y="2-tail GSEA dES (Network B)" ) +
+ggtitle( paste0("Network A/B comparison - TF (n=", length(common.tfs),") dES scores per GB subtype\n(with Spearman's rank correlations)\n") ) +
+guides(colour=FALSE) + # remove legend
+geom_text(data=plot.text, aes(label=label), x=-1, y=1.5 ) + # add corr values to plot
+theme_bw() + theme(strip.background=element_blank() ) # use b/w theme, remove facet strip background
+
+# generate outputname
+outputname <- paste0( "./res_cohort_comparison/", "ManuscriptFigure_Supp_RTN_cohort_comparison_", Sys.Date(), ".pdf")
+# open plotting device
+pdf(file=outputname, width=10, height=10, bg="transparent")
+print(p)
+dev.off()
+# output as PNG: 
+# set #ppi
+ppi <- 300
+# generate outputname
+outputname <- paste0( "./res_cohort_comparison/", "ManuscriptFigure_Supp_RTN_cohort_comparison_", Sys.Date(), ".png")
+# open plotting device
+png(file=outputname, width=10*ppi, height=10*ppi, res=ppi, bg="transparent")
+print(p)
+dev.off()
+
+#############################################
+#
+# 6. save the R objects generated in this analysis
+# and output session info
+#
+#############################################
+# save the results R objs generated
+save( common.tfs, tfs.test, tfs.validation, mat.olap.venn, plot.data, plot.text, col.scale,
+	file=paste0( Sys.Date(), "_combined_GBM_RTN_cohort_comparison_ResObj.Rdata" )
+	)
+# output session info
+seshinf <- paste0( Sys.Date(), "_combined_GBM_RTN_cohort_comparison_sessionInfo.txt" )
+writeLines( capture.output(sessionInfo()), seshinf )
