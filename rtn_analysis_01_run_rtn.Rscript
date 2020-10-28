@@ -1,0 +1,470 @@
+#!/bin/R-3.4.3
+
+########################################
+#
+# rtn_analysis_01_run_rtn.Rscript
+#
+# Mike Fletcher
+# 20201025
+#
+# R version used: 3.4.3
+#
+# (original name: gbm_rtn_analysis_01_run_rtn_combined.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# RTN gene regulatory network analysis of GBMs using GX microarray data
+# combined RTN for both test/network A (TCGA) and validation/network B (assorted studies) cohorts
+#
+# script to run RTN analysis on the GBM expression microarray data...
+#	1. reads in the raw Affy array data and normalises said data using GCRMA;
+#	2. infers the gene regulatory network (with RTN) for GBMs based on this gene expression array data with RTN;
+#	3. identifies master regulators for each GBM subtype based on our subtype-specific gene lists (subtype_genes_limma_sfig2.Rscript output)
+#
+########################################
+# INPUTS
+########################################
+#
+#	(i) Affy HT-HG-U133A gene expression microarray data from TCGA in **raw .cel file format**; n = 526 samples.
+#		this can be downloaded from the GDC legacy archive: https://gdc-portal.nci.nih.gov/legacy-archive/
+#		select the TCGA GBM project, and look for the **raw .cel files**
+#	(ii) collated GBM Affy HG-U133-Plus2 gene expression microarray data in **raw .cel file format**; n = 575 samples.
+#		see samplesheet validation_GBMs_samplesheet_final.csv for more information
+# 		GBM samples collected from ENA accession E-MTAB-3073,
+#		and GEO accessions GSE4290, GSE7696, GSE16011, GSE43378
+#		use the MAGE-TAB information included in the archive to identify duplicates
+#	(iii) the HIPO016 GBM subtype-specific gene lists
+#		this script uses the output of the limma pipeline, i.e. subtype_genes_limma_sfig2.Rscript 
+#	(iv) a list of TFs used as input for the ARACNe/MRA analysis
+#			e.g. Carro et al.: http://www.nature.com/nature/journal/v463/n7279/full/nature08712.html
+#			or Vaquerizas et al.: http://www.nature.com/nrg/journal/v10/n4/full/nrg2538.html <-- used here
+#			need the gene symbols.
+#		
+########################################
+# OUTPUTS
+########################################
+#
+#	(i) RTN plots showing the 1- and 2-tail GSEA results for the subtype-specific master regulators, for test+validation+HIPO016 cohorts
+#	(ii) a saved Renv (.pdf) and session info (.txt)
+#	(iii) TNIs for each cohort in individual Rdata files
+#	(iv) the connectivity maps showing overlap of regulons for TFs in each subtype (igraph format)
+#
+#  SUPPLEMENTARY FIGURE 3A:
+#	(v) the MDS plots showing the network B/validation cohort before/after ComBat batch removal
+#
+# and then the results from this analysis can be fed into further downstream analyses (produce pretty images of networks, heatmaps, network validation, et al.)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# CLUSTER USAGE: ensure that enough resources (esp. mem!) are requested if running on a cluster; 
+# otherwise you get errors during the parallelised GSEA steps like:
+#			Error in unserialize(node$con) : error reading from connection
+# which are due to lack of mem.
+#
+# this is a VERY resource-intensive analysis; lots and lots of permutation testing
+# I ran with 32 cores, 128gig memory 
+#
+# note the #cores to parallelise over is defined in the gbm_hipo016_common.R file (sourced by this)
+#
+########################################
+
+####################
+#
+# VARIABLES
+# for working dir, input data, sample sheets, etc.
+#
+####################
+#
+# source new common code for the GBM RTN analysis: 
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+#
+####################
+#
+# SETUP
+#
+# load libraries, set working dir, setup paths
+#
+####################
+# affy array data analysis
+suppressMessages( library(affy) )
+# load libs for GCRMA normalisation
+suppressMessages( library(gcrma) )
+# for the arrays: get probe -> entrezID/symbol mappings
+# for both the HT-HG-U133A and HG-U133-Plus2 arrays
+# (representing TCGA/test and validation cohorts respectively)
+suppressMessages( library(hthgu133a.db) )
+suppressMessages( library(hgu133plus2.db) )
+# rtn
+suppressMessages( library(RTN) )
+# load SNOW
+suppressMessages( library(snow) )
+# load SVA for batch effect removal
+suppressMessages( library(sva) )
+# load for plotting
+suppressMessages( library(ggplot2) )
+# load DESeq2 for VST
+suppressMessages( library(DESeq2) )
+# load libs for annotation
+suppressMessages( library("AnnotationDbi") )
+suppressMessages( library("org.Hs.eg.db") )
+
+##########
+# get paths to input .cel files
+#########
+# test cohort
+#########
+# read in samplesheet
+samplesheet.test <- read.table( file=samplesheet.path.test, sep=",", header=T, stringsAsFactors=F )
+# get cel names based on recursive listing of data dir and grep-ing for .CEL file extension
+# need to use recursive as the TCGA data are in sample-specific directories
+cel.names <- list.files( data.dir.test, recursive=T )[ grep(x=list.files( data.dir.test, recursive=T ), pattern=".CEL") ]
+# now: filter these cel names for those present in samplesheet; use grep, return values
+cel.names <- sapply( X=samplesheet.test$Array.Data.File, FUN=grep, x=cel.names, value=T )
+# then build paths using above
+data.paths.test <- paste( data.dir.test, "/", cel.names, sep="" )
+##########
+# validation cohort
+#########
+# read in samplesheet
+samplesheet.validation <- read.table( file=samplesheet.path.validation, sep=",", header=T, stringsAsFactors=F )
+# get cel names based on listing of data dir and grep-ing for .CEL file extension
+# all cels in that dir (no view by sample dirs)
+# have varying .cel and .CEL so ignore case
+cel.names <- list.files( data.dir.validation )[ grep(x=list.files( data.dir.validation ), pattern=".cel", ignore.case=T) ]
+# now: filter these cel names for those present in samplesheet; use grep, return values
+cel.names <- sapply( X=samplesheet.validation$CEL_Filename, FUN=grep, x=cel.names, value=T )
+# then build paths using above
+data.paths.validation <- paste( data.dir.validation, "/", cel.names, sep="" )
+
+####################
+#
+# LOAD AND NORMALISE ARRAY DATA
+#
+####################
+# test cohort
+#########
+# check whether saved R obj already exists (whether length of grep result vector is zero)
+# if not, run code; if it does, load it
+if( length( grep( pattern="_RTN_GBM_input_filtered_GX_matrix_test.Rdata", x=list.files() ) ) == 0 ) 
+	{
+		message( "Processing input GX matrix - test cohort..." )
+		# read in data...
+		# options:
+		# filenames = data paths as character vector, built above
+		data.test <- read.affybatch( filenames=data.paths.test )
+		# generate affinities for gcrma
+		affinities.test <- compute.affinities( cdfname="hthgu133a" )
+		# then do gcrma
+		# use:
+		# object = loaded gx data
+		# affinities = as calculated above
+		# affinity source = local (in-experiment) data
+		gx.test <- gcrma( object=data.test, affinity.info=affinities.test, affinity.source="local" )
+		# returns ExpressionSet obj
+		# with 22277 features
+		
+		#########
+		# test cohort array annotation and gx matrix filtering
+		#########
+		# build annotation dataframe containing: ENTREZ IDs, gene symbols + probe IDs.
+		array.anno.test <- cbind( as.data.frame( hthgu133aENTREZID ), symbol=as.data.frame( hthgu133aSYMBOL )$symbol )
+		# gives 19931 probes/rows (n.b. some genes have multiple probes)
+
+		# filter gx matrix for probes that have a gene ID in this annotation dataframe.
+		gx.filt.test <- exprs(gx.test)[ !is.na( match( rownames(gx.test), array.anno.test$probe_id ) ), ]
+		# leaves 19931 features after filtering
+
+		# this is the input to RTN - save copy of processed+filtered GX obj 
+		save( object=gx.filt.test, file=paste( Sys.Date(), "_RTN_GBM_input_filtered_GX_matrix_test.Rdata", sep="" ) )
+	} else {
+		message( "Loading previously processed test cohort GX matrix." )
+		load( list.files()[ grep( pattern="_RTN_GBM_input_filtered_GX_matrix_test.Rdata", x=list.files() ) ] )
+	}
+ 
+#########
+# validation cohort
+#########
+if( length( grep( pattern="_RTN_GBM_input_filtered_GX_matrix_validation.Rdata", x=list.files() ) ) == 0 ) 
+	{
+		message( "Processing input GX matrix - validation cohort..." )
+		# read in data...
+		# options:
+		# filenames = data paths as character vector, built above
+		data.validation <- read.affybatch( filenames=data.paths.validation )
+		# generate affinities for gcrma
+		affinities.validation <- compute.affinities( cdfname="hgu133plus2" )
+		# then do gcrma
+		# use:
+		# object = loaded gx data
+		# affinities = as calculated above
+		# affinity source = local (in-experiment) data
+		gx.validation <- gcrma( object=data.validation, affinity.info=affinities.validation, affinity.source="local" )
+		# returns ExpressionSet obj
+		# with 54675 features
+ 
+		#########
+		# validation cohort array annotation and gx matrix filtering
+		#########
+		# build annotation dataframe containing: ENTREZ IDs, gene symbols + probe IDs.
+		array.anno.validation <- cbind( as.data.frame( hgu133plus2ENTREZID ), symbol=as.data.frame( hgu133plus2SYMBOL )$symbol )
+		# gives 41551 probes/rows (n.b. some genes have multiple probes)
+
+		# filter gx matrix for probes that have a gene ID in this annotation dataframe.
+		gx.filt.validation <- exprs(gx.validation)[ !is.na( match( rownames(gx.validation), array.anno.validation$probe_id ) ), ]
+		# leaves 41551 features after filtering
+		
+		#########
+		# remove batch effects using ComBat
+		#########
+		# first: plot MDS of samples pre-batch effect removal
+        # use code modified from 'original' my.mds.plot b/c that has hardcoded GB subtype colours
+		# 
+        # calculate Euclidean distances, coerce distances to matrix
+        sampleDistMatrix <- as.matrix( dist( t( gx.filt.validation ) ) )
+        # generate mds data frame:
+        mds <- data.frame(cmdscale(sampleDistMatrix))
+        mds$class <- samplesheet.validation$Study_Accession_Code
+        # plot as pdf
+		title <- "MDS - input filtered GX matrix\nCohort B (Assorted) - before ComBat"  
+        outputname <- paste0( Sys.Date(), "_MDS_plot_input_filtered_GX_matrix_validation.pdf" )
+        pdf(outputname)
+        print( qplot(X1,X2,color=class, data=mds, main=title) + theme_bw() )
+        dev.off()
+		
+		# run ComBat
+		# define batches - use the study accession codes
+		gx.filt.validation <- ComBat(dat=gx.filt.validation, batch=factor(samplesheet.validation$Study_Accession_Code), mod=NULL)
+		
+		# plot MDS again:
+        # calculate Euclidean distances, coerce distances to matrix
+        sampleDistMatrix <- as.matrix( dist( t( gx.filt.validation ) ) )
+        # generate mds data frame:
+        mds <- data.frame(cmdscale(sampleDistMatrix))
+        mds$class <- samplesheet.validation$Study_Accession_Code
+        # plot as pdf
+		title <- "MDS - input filtered GX matrix\nCohort B (Assorted) - after ComBat"  
+        outputname <- paste0( Sys.Date(), "_MDS_plot_input_filtered_GX_matrix_validation_after_ComBat.pdf" )
+        pdf(outputname)
+        print( qplot(X1,X2,color=class, data=mds, main=title) + theme_bw() )
+        dev.off()    
+
+		# this is the input to RTN - save copy of processed+filtered GX obj 
+		save( object=gx.filt.validation, file=paste( Sys.Date(), "_RTN_GBM_input_filtered_GX_matrix_validation.Rdata", sep="" ) )
+	} else {
+		message( "Loading previously processed validation cohort GX matrix." )
+		load( list.files()[ grep( pattern="_RTN_GBM_input_filtered_GX_matrix_validation.Rdata", x=list.files() ) ] )
+	}	
+
+####################
+#
+# GET ANNOTATION DATA FOR RTN, FILTER GX OBJS FOR MATCHING GENES
+#
+####################
+# use the TF list from:
+# "A census of human transcription factors: function, expression and evolution"
+# Vaquerizas et al. Nat Gen 2009
+# http://www.nature.com/nrg/journal/v10/n4/full/nrg2538.html
+# supplementary table 3 from the paper
+# take only the TFs with class 'a', 'b' and 'other' - "high confidence" TFs, n=1391
+#
+# Original file: http://www.nature.com/nrg/journal/v10/n4/extref/nrg2538-s3.txt
+# downloaded to location defined above and renamed
+# need to skip first 11 lines, then tab-delim text
+tfs.table <- read.table(file=vaquerizas.tfs.path, sep="\t", header=T, skip=11, quote="", fill=T, stringsAsFactors=F)
+# filter for those with high-confidence Tf classes defined above:
+tfs.table <- tfs.table[ tfs.table$Class=="a" | tfs.table$Class=="b" | tfs.table$Class=="other", ]
+# take the column with gene symbols
+# remove blank fields (matching "") then rename
+tfs <- tfs.table$HGNC.symbol
+tfs <- tfs[!tfs==""]
+# leaves 1333 gene symbols
+
+###############
+# rebuild array annotation dataframes - needed in next step and not saved in GX matrix creation above (!)
+# same as in above
+###############
+# build annotation dataframe containing: ENTREZ IDs, gene symbols + probe IDs.
+array.anno.test <- cbind( as.data.frame( hthgu133aENTREZID ), symbol=as.data.frame( hthgu133aSYMBOL )$symbol )
+# gives 19931 probes/rows (n.b. some genes have multiple probes)
+
+# build annotation dataframe containing: ENTREZ IDs, gene symbols + probe IDs.
+array.anno.validation <- cbind( as.data.frame( hgu133plus2ENTREZID ), symbol=as.data.frame( hgu133plus2SYMBOL )$symbol )
+# gives 41551 probes/rows (n.b. some genes have multiple probes)
+
+############################################################
+#
+# START RTN ANALYSIS!
+#
+# use process.tni() for test+validation cohorts
+#
+###############
+# run on test+validation cohorts!
+# check whether htey already exist; if not, run analysis
+# then save processed TNIs
+###############
+# test
+if( length( grep( pattern="_RTN_GBM_processed_TNI_test.Rdata", x=list.files() ) ) == 0 ) 
+	{
+		message( "Processing TNI for test cohort..." )
+		rtni.test <- process.tni( gx.matrix=gx.filt.test, array.anno=array.anno.test, tfs=tfs, parallel.cores.tni=parallel.cores.tni )
+		save( rtni.test, file=paste( Sys.Date(), "_RTN_GBM_processed_TNI_test.Rdata", sep="" ) )
+	} else {
+		message( "Loading previously processed TNI for test cohort..." )		
+		load( list.files()[ grep( pattern="_RTN_GBM_processed_TNI_test.Rdata", x=list.files() ) ] )
+	}	
+# validation
+if( length( grep( pattern="_RTN_GBM_processed_TNI_validation.Rdata", x=list.files() ) ) == 0 ) 
+	{
+		message( "Processing TNI for validation cohort..." )
+		rtni.validation <- process.tni( gx.matrix=gx.filt.validation, array.anno=array.anno.validation, tfs=tfs, parallel.cores.tni=parallel.cores.tni )
+		save( rtni.validation, file=paste( Sys.Date(), "_RTN_GBM_processed_TNI_validation.Rdata", sep="" ) )
+	} else {
+		message( "Loading previously processed TNI for validation cohort..." )
+		load( list.files()[ grep( pattern="_RTN_GBM_processed_TNI_validation.Rdata", x=list.files() ) ] )
+	}
+	
+#########################
+#
+# run for the 4-subtype analysis
+#
+# use a relaxed adj.pval threshold to find each subtype's 'hits'
+# as the 'hits' are only used in the 1-tail GSEA to filter out the TFs tested in the 2-tail GSEA
+# so with a sufficiently stringent pval threshold for the 2-tail GSEA this won't affect too much...
+#
+#########################
+#########################
+# MRA with RTK_I signature
+#########################
+# rtki-calculated gx, etc. lives in 'limma.rtki' df
+# now, for MRA/GSEA analysis, coerce the data into forms required...
+# 
+# first: build 'phenotype' vector as defined below. does not need to be sorted
+rtki.phenotype <- limma.rtki$logFC
+names(rtki.phenotype) <- limma.rtki$hgnc_symbol # add names
+rtki.phenotype <- rtki.phenotype[ !is.na( names(rtki.phenotype) ) ] # remove NAs
+# second: for 'hits' take the gene IDs with adj pval < 0.01...
+rtki.hits <- limma.rtki$hgnc_symbol[ limma.rtki$adj.P.Val < 0.01 ]
+
+# now: run TNA on test+validation cohorts
+rtna.rtki.test <- analyse.tna( rtni=rtni.test, cohort="test", subtype="RTK_I", phenotype=rtki.phenotype, hits=rtki.hits, parallel.cores.tna=parallel.cores.tna )
+rtna.rtki.validation <- analyse.tna( rtni=rtni.validation, cohort="validation", subtype="RTK_I", phenotype=rtki.phenotype, hits=rtki.hits, parallel.cores.tna=parallel.cores.tna )
+
+#########################
+# MRA with MES signature
+#########################
+# as above
+mes.phenotype <- limma.mes$logFC
+names(mes.phenotype) <- limma.mes$hgnc_symbol # add names
+mes.phenotype <- mes.phenotype[ !is.na( names(mes.phenotype) ) ] # remove NAs
+# second: for 'hits' take the gene IDs with adj pval < 0.01...
+mes.hits <- limma.mes$hgnc_symbol[ limma.mes$adj.P.Val < 0.01 ]
+
+# now: run TNA on test+validation cohorts
+rtna.mes.test <- analyse.tna( rtni=rtni.test, cohort="test", subtype="MES", phenotype=mes.phenotype, hits=mes.hits, parallel.cores.tna=parallel.cores.tna )
+rtna.mes.validation <- analyse.tna( rtni=rtni.validation, cohort="validation", subtype="MES", phenotype=mes.phenotype, hits=mes.hits, parallel.cores.tna=parallel.cores.tna )
+
+#########################
+# MRA with IDH signature
+#########################
+# as above
+idh.phenotype <- limma.idh$logFC
+names(idh.phenotype) <- limma.idh$hgnc_symbol # add names
+idh.phenotype <- idh.phenotype[ !is.na( names(idh.phenotype) ) ] # remove NAs
+# second: for 'hits' take the gene IDs with adj pval < 0.01..
+idh.hits <- limma.idh$hgnc_symbol[ limma.idh$adj.P.Val < 0.01 ]
+
+# now: run TNA on test+validation cohorts
+rtna.idh.test <- analyse.tna( rtni=rtni.test, cohort="test", subtype="IDH", phenotype=idh.phenotype, hits=idh.hits, parallel.cores.tna=parallel.cores.tna )
+rtna.idh.validation <- analyse.tna( rtni=rtni.validation, cohort="validation", subtype="IDH", phenotype=idh.phenotype, hits=idh.hits, parallel.cores.tna=parallel.cores.tna )
+
+#########################
+# MRA with RTK_II signature
+#########################
+# as above
+rtkii.phenotype <- limma.rtkii$logFC
+names(rtkii.phenotype) <- limma.rtkii$hgnc_symbol # add names
+rtkii.phenotype <- rtkii.phenotype[ !is.na( names(rtkii.phenotype) ) ] # remove NAs
+# second: for 'hits' take the gene IDs with adj pval < 0.01...
+rtkii.hits <- limma.rtkii$hgnc_symbol[ limma.rtkii$adj.P.Val < 0.01 ]
+
+# now: run TNA on test+validation cohorts
+rtna.rtkii.test <- analyse.tna( rtni=rtni.test, cohort="test", subtype="RTK_II", phenotype=rtkii.phenotype, hits=rtkii.hits, parallel.cores.tna=parallel.cores.tna )
+rtna.rtkii.validation <- analyse.tna( rtni=rtni.validation, cohort="validation", subtype="RTK_II", phenotype=rtkii.phenotype, hits=rtkii.hits, parallel.cores.tna=parallel.cores.tna )
+
+###########################################################################
+#
+# output igraph objs and associated annotation information to make pretty regulatory networks
+#
+# associated anno - for each subtype:
+#	for MRs: 2-tail GSEA stats = 2-tail GSEA results slot in TNA obj
+#	for targets: logFC information = phenotype slot in TNA obj
+#
+###########################################################################
+# output
+# saved in results dir
+output.tna.maps( rtna.rtki.test, "RTK_I", "test" )
+output.tna.maps( rtna.rtkii.test, "RTK_II", "test" )
+output.tna.maps( rtna.mes.test, "MES", "test" )
+output.tna.maps( rtna.idh.test, "IDH", "test" )
+output.tna.maps( rtna.rtki.validation, "RTK_I", "validation" )
+output.tna.maps( rtna.rtkii.validation, "RTK_II", "validation" )
+output.tna.maps( rtna.mes.validation, "MES", "validation" )
+output.tna.maps( rtna.idh.validation, "IDH", "validation" )
+output.tna.maps( rtna.rtki.hipo016, "RTK_I", "HIPO016" )
+output.tna.maps( rtna.rtkii.hipo016, "RTK_II", "HIPO016" )
+output.tna.maps( rtna.mes.hipo016, "MES", "HIPO016" )
+output.tna.maps( rtna.idh.hipo016, "IDH", "HIPO016" )
+
+# output the GSEA information:
+# output for 4-subtype analysis
+for ( subtype in c("idh", "mes", "rtki", "rtkii") )
+ {
+  # dir for subtype results: need to coerce to uppercase, add underscore for RTK_ subtypes
+  dir <- gsub( pattern="RTK", replacement="RTK_", x=toupper(subtype) )
+  subtype.dir <- paste("tna_results", dir, sep = "_")      
+        
+  for ( cohort in c("test", "validation", "hipo016"))      
+    {
+      # find obj
+       message(paste( "rtna", subtype, cohort, sep="." ))     
+       rtna <- get( paste( "rtna", subtype, cohort, sep="." ) )
+
+       # write 2-tail GSEA results for MRs:
+       # generate outputname - go to subtype dir:
+       outputname <- paste( subtype.dir, "/", Sys.Date(), "_RTN_GBM_", dir, "_TNA_", cohort, "_amap_rmap_MR_annotations.csv", sep="" )           
+       write.csv( x=rtna@results$GSEA2.results$differential, file=outputname )      
+            
+       # write phenotype vector for targets:
+       outputname <- paste( subtype.dir, "/", Sys.Date(), "_RTN_GBM_", dir, "_TNA_", cohort, "_amap_rmap_target_annotations.csv", sep="" )           
+       write.csv( x=rtna@phenotype, file=outputname )           
+    }    
+ }
+
+# remove rtna
+rm(rtna)
+
+###########################################################################
+#
+# save T/V TNA objects to Rdata objs
+#
+###########################################################################
+save( rtna.rtki.test, rtna.rtkii.test, rtna.mes.test, rtna.idh.test, 
+	rtna.rtki.validation, rtna.rtkii.validation, rtna.mes.validation, rtna.idh.validation, 
+	file=paste( Sys.Date(), "_combined_GBM_RTN_T_V_ResObj.Rdata", sep="" ) )
+	
+###########################################################################
+# 
+# save Renv and session info
+#
+###########################################################################
+# save R image and output session info
+save.image( file=paste(Sys.Date(), "_combined_GBM_RTN_Renv.Rdata", sep="")  )
+# output session info
+seshinf <- paste ( Sys.Date(), "_combined_GBM_RTN_sessionInfo.txt", sep="" )
+writeLines( capture.output(sessionInfo()), seshinf )

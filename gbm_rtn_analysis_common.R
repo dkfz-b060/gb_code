@@ -1,12 +1,25 @@
 #!/bin/R-3.4.3
 
+########################################
+#
 # gbm_rtn_analysis_common.R
 #
-# 20170124
+# Mike Fletcher
+# 20201025
 #
-# Common code for the RTN analysis on GBM data:
-# - definitions for the analysis (e.g. paths)
-# - functions that are reused throughout the code
+# R version used: 3.4.3
+#
+# (original name: gbm_rtn_analysis_common.R)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# shared functions/definitions for the RTN analysis
+#
+########################################
 
 ####################################################################################################
 #

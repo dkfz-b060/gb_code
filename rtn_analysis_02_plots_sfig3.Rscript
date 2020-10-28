@@ -1,0 +1,333 @@
+#!/bin/R-3.4.3
+
+########################################
+#
+# rtn_analysis_02_plots_sfig3.Rscript
+#
+# Mike Fletcher
+# 20201025
+#
+# R version used: 3.4.3
+#
+# (original name: gbm_rtn_analysis_02_gsea_mr_ComplexHeatmap.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# RTN gene regulatory network analysis of GBMs using GX microarray data
+# part2: generate heatmap of consensus MRs showing differential activity between subtypes
+#
+# n.b. "consensus" MRs here mean MRs identified as significant in the 2-tail GSEA in both
+# the test/network A and validation/network B networks
+#
+########################################
+# INPUTS
+########################################
+#
+# loads the saved Renv from the end of rtn_analysis_01_run_rtn.Rscript
+#
+########################################
+# OUTPUTS
+########################################
+#
+# SUPPLEMENTARY FIGURE 3:
+#	- SFig 3d: the MR activation (2-tail GSEA differential ES) heatmap for the consensus subtype MRs (.pdf)
+#		NOTE this also has an additional heatmap showing subtype GX of the MRs; this was removed in the final figure!
+#
+# as well as various results tables (.csv) for this RTN analysis
+# and a saved Renv (.Rdata) and the session information (.txt)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# the loaded Renv will need a decent chunk of memory (maybe 16g?) but otherwise this just makes some figures so is quite light.
+#
+########################################
+
+####################
+#
+# SETUP
+# working dir, load libs, load data...
+#
+####################
+#
+# source common code for the GBM RTN analysis: 
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+#
+# load libraries
+suppressMessages( library(RTN) )
+suppressMessages( library(gplots) )
+suppressMessages( library(limma) )
+# heatmap colours
+suppressMessages( library(marray) )
+# load libraries for Zuguang's EnrichedHeatmap package
+suppressMessages( library(ComplexHeatmap) )
+suppressMessages( library(circlize) )
+suppressMessages( library(EnrichedHeatmap) )
+suppressMessages( library(GetoptLong) )
+# load saved Renv from end of rtn script:
+message("Loading saved RTN Renv (may take some time)...")
+load(list.files()[ grep( x=list.files(), pattern="_combined_GBM_RTN_Renv.Rdata" ) ])
+
+# re-source common code for the GBM RTN analysis (in case load Renv loads old code)
+source("/home/fletcher/git_repos/gbm-master-regulators/gbm_rtn_analysis_common.R")
+
+# create new output dir for heatmaps:
+system2("mkdir", "./res_mr_heatmaps/")
+
+# read in sample metadata for full dataset, not just tumours:
+# lives in /icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/WGBS_final_cohort/metadata/HIPO016_GBM_subtyping_FINAL_20170628.rds
+metadata.all <- readRDS(path.metadata.rds)
+
+#############################################
+#
+# 1. first: get all sig. MRs in 2-tail gsea for test+valid cohorts, so can re-run the 2-tail GSEA for all sig. MRs in all subtypes/cohorts
+#
+#############################################
+#
+# do for each separate TNA analysis and combine into single vector taking unique hits
+# take unique MR IDs only
+gsea.tfs <- unique( c( get.consensus.mrs( rtna.rtki.test, rtna.rtki.validation ),
+	get.consensus.mrs( rtna.idh.test, rtna.idh.validation ),
+	get.consensus.mrs( rtna.mes.test, rtna.mes.validation ),
+	get.consensus.mrs( rtna.rtkii.test, rtna.rtkii.validation )
+	) )
+
+#############################################
+#
+# 2. next: need to calculate enrichment scores for ALL the consensus MRs across all subtypes/cohorts
+#
+#############################################
+message("Calculating enrichment scores for consensus MRs in all networks...")
+# re-run the 2-tail gsea on the rtna objs
+# for both test+validation cohorts
+# 
+# other options:
+# use pValueCutoff=1 to keep all results
+# use stepFilter=F to not filter 
+# use tfs=gsea.tfs to calculate for these MRs specifically
+# no need to do permuations because we're not interested in the pvals, just want the enrichment scores!
+rtna.consensusGSEA.idh.test <- tna.gsea2( rtna.idh.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.mes.test <- tna.gsea2( rtna.mes.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtki.test <- tna.gsea2( rtna.rtki.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtkii.test <- tna.gsea2( rtna.rtkii.test, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.idh.validation <- tna.gsea2( rtna.idh.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.mes.validation <- tna.gsea2( rtna.mes.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtki.validation <- tna.gsea2( rtna.rtki.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+rtna.consensusGSEA.rtkii.validation <- tna.gsea2( rtna.rtkii.validation, pValueCutoff=1, tfs=gsea.tfs, nPermutations=1 )
+
+# generate output matrix for input into plotting heatmaps
+#
+# want to plot the *differential* scores, of course (showing the calculated activation/repression of a
+# given regulon in a particular subtype/cohort)
+#
+# order alphabetically so that the rownames match across all TNAs
+gsea.res <- cbind( 
+	rtna.consensusGSEA.idh.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.idh.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.idh.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.idh.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.mes.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.mes.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.mes.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.mes.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtki.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtki.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtki.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtki.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtkii.test@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtkii.test@results$GSEA2.results$differential$Regulon), "Observed.Score" ], 
+	rtna.consensusGSEA.rtkii.validation@results$GSEA2.results$differential[ order(rtna.consensusGSEA.rtkii.validation@results$GSEA2.results$differential$Regulon), "Observed.Score" ]
+	)
+
+# add rownames based on alphabetical ordering, as used in cbind...
+rownames(gsea.res) <- rtna.consensusGSEA.idh.test@results$GSEA2.results$differential$Regulon[ order(rtna.consensusGSEA.idh.test@results$GSEA2.results$differential$Regulon) ]
+
+# add column and row names	
+# colnames based on cbind() above
+colnames(gsea.res) <- c( 
+		"IDH - test", "IDH - validation",
+		"MES - test", "MES - validation",
+		"RTK_I - test", "RTK_I - validation", 
+		"RTK_II - test", "RTK_II - validation"
+		)
+
+# reorder columns alphabetically (for later heatmap display) 
+gsea.res <- gsea.res[ , order( colnames(gsea.res) ) ]
+
+###############
+# also: generate matrix to use as significance heatmap
+# plot as 2nd heatmap 
+#
+# here: want to find all the MRs significant within a subtype/cohort
+###############
+# first: match all subtype/cohort-significant MRs with rownames in the results matrix
+# 
+# construct a 2nd matrix of these logical vectors
+gsea.res.cellnotes <- cbind( rownames(gsea.res) %in% rtna.idh.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.idh.validation@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.mes.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.mes.validation@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtki.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtki.validation@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtkii.test@results$GSEA2.results$differential$Regulon,
+	rownames(gsea.res) %in% rtna.rtkii.validation@results$GSEA2.results$differential$Regulon
+)
+# add column and row names	
+# colnames based on cbind() above
+colnames(gsea.res.cellnotes) <- c( 
+	"IDH - test", "IDH - validation",
+	"MES - test", "MES - validation",
+	"RTK_I - test", "RTK_I - validation",
+	"RTK_II - test", "RTK_II - validation"
+	)
+# reorder columns alphabetically		
+gsea.res.cellnotes <- gsea.res.cellnotes[ , order( colnames(gsea.res.cellnotes) ) ]
+	
+# add rownames from gsea.res
+rownames(gsea.res.cellnotes) <- rownames(gsea.res)
+# now: replace T/F false values with text labels: "non-significant" or "significant"
+gsea.res.cellnotes[ gsea.res.cellnotes == TRUE ] <- "significant"
+# has been coerced to character matrix so now match on characters
+gsea.res.cellnotes[ gsea.res.cellnotes == "FALSE" ] <- "non-significant"
+
+###############
+# finally: find GX values for each MR 
+# plot as 3rd heatmap 
+#
+# here: want to find all the MRs significant within a subtype/cohort
+###############
+message("Look up GX values for each MR...")
+# first, get annotation df with gene symbols + ENSG IDs
+suppressMessages( library(hthgu133a.db) )
+anno <- merge( x=as.data.frame( hthgu133aENSEMBL ), y=as.data.frame( hthgu133aSYMBOL ), all=T )
+# now get only the rows matching our consensus MRs
+# drop probe_ids and take unique rows only
+anno <- unique( anno[ anno$symbol %in% rownames(gsea.res), c("ensembl_id", "symbol") ] )
+
+# clean up anno df:
+# remove rows with ENSG IDs not in the expression matrix
+anno <- anno[ !is.na( pmatch( anno$ensembl_id, rownames(expr) ) ), ]
+# remove 2nd BACH1 ENSG ID - it's a fricken intronic lncRNA, sigh
+anno <- anno[ anno$ensembl_id!="ENSG00000248476", ]
+
+# use the ENSG IDs to look up the MR GX values from the pre-loaded 'expr' HIPO016 GX matrix
+# (see gbm_rtn_analysis_common.R)
+mr.gx <- expr[ pmatch(anno$ensembl_id, rownames(expr) ), ]
+# transform to log2 (rpkm+1)
+mr.gx <- log2(mr.gx+1)
+# remove total_brain sample from here - not used
+mr.gx <- mr.gx[ , colnames(mr.gx)!="total_brain" ]
+
+# summarise MR GX for each subtype, including normals
+# build into new dataframe
+mr.gx.summary <- data.frame(
+	IDH = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="IDH"] ] ),
+	MES = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="MES"] ] ),
+	RTK_I = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="RTK_I"] ] ),
+	RTK_II = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="RTK_II"] ] ),
+	normal = rowMeans( mr.gx[ , colnames(mr.gx) %in% metadata.all$ak_id[metadata.all$subtype_final=="normal"] ] )
+	)
+# replace rownames (ENSG IDs) with symbols
+rownames(mr.gx.summary)[ pmatch( x=anno$ensembl_id, table=rownames(mr.gx.summary) ) ] <- anno$symbol
+# reorder df so it's in the same order as the gsea.res df	
+mr.gx.summary <- mr.gx.summary[ match( rownames(gsea.res), rownames(mr.gx.summary) ), ]
+
+#############################################
+#
+# 3. generate output plots
+#
+# within each, plot 3 heatmaps:
+#	(i) differential enrichment scores
+#	(ii) significance 
+#	(iii) MR GX in HIPO016 samples
+#
+#############################################
+message("Generating output plots!")
+####################
+#
+# a) plot full set of consensus MRs for test+validation cohorts - combined 4-subtype - test+validation+HIPO016 results
+#
+####################
+heatmap.consensus.mrs( gsea.res=gsea.res, 
+	gsea.res.cellnotes=gsea.res.cellnotes, 
+	mr.gx.summary=mr.gx.summary, 
+	outputprefix=paste( "res_mr_heatmaps/", Sys.Date(), "_combined_GBM_RTN_2-tail_GSEA_consensus_results_summary_heatmap_all", sep="" ) 
+	)
+
+#############################################
+#
+# 6. generate full results table for this analysis,
+# take gsea.res (with the differential ES for each network/signature already)
+# and add in other information for each network/signature: regulon size; pval; adj pval
+#
+#############################################
+# copy gsea.res object, then edit colnames, to strip spaces and add _diffEnrichScore:
+gsea.res.table <- as.data.frame(gsea.res)
+colnames(gsea.res.table) <- gsub( pattern=" - ", replacement="_", x=colnames(gsea.res.table))
+colnames(gsea.res.table) <- paste0( colnames(gsea.res.table), "_dES" )
+
+# now, for each subtype/network, add in additional information from the appropriate TNA obj
+for( subtype in c("idh", "mes", "rtki", "rtkii") )
+{
+	message(subtype)
+	for( network in c("test", "validation") )
+	{
+		message(network)
+		# get appropriate tna obj:
+		rtna <- get( paste0("rtna.", subtype, ".", network) )
+		# extract df with 2-tail gsea differential results
+		df <- rtna@results$GSEA2.results$differential
+		
+		# now: to gsea.res.table, add in the info based on matching rownames(=TF symbols), to appropriately named columns:
+		gsea.res.table[ , paste0( toupper(subtype), "_", network, "_", "regulonSize" ) ] <- df[ match(rownames(gsea.res.table), rownames(df)), "Regulon.Size" ]
+		gsea.res.table[ , paste0( toupper(subtype), "_", network, "_", "pval" ) ] <- df[ match(rownames(gsea.res.table), rownames(df)), "Pvalue" ]
+		gsea.res.table[ , paste0( toupper(subtype), "_", network, "_", "adjPval" ) ] <- df[ match(rownames(gsea.res.table), rownames(df)), "Adjusted.Pvalue" ]		
+	}
+}
+
+# clean up colnames for tidiness:
+# split RTKI/RTKII with underscore
+colnames(gsea.res.table) <- gsub( pattern="RTKI", replacement="RTK_I", x=colnames(gsea.res.table))
+
+# sort by colnames:
+gsea.res.table <- gsea.res.table[ , order(colnames(gsea.res.table)) ]
+
+# then output table as csv:
+outputname <- paste0( Sys.Date(), "_RTN_GBM_Master_Regulator_Analysis_GSEA2_results_table.csv" )
+write.csv(x=gsea.res.table, file=outputname)
+
+#############################################
+#
+# save + output lists of TFs present in the two networks
+# for use in other analyses
+#
+#############################################
+# these live in the @regulatoryElements slot of the TNI objects
+# generate a df and output:
+network.tfs <- data.frame(
+	hgnc_symbol=union( names(rtni.test@regulatoryElements), names(rtni.validation@regulatoryElements) )
+	)
+# add in cols for the networks, with the array probeID used
+# therefore if a TF is NOT in the network, will return NA
+network.tfs$network.A <- rtni.test@regulatoryElements[ match( network.tfs$hgnc_symbol, names(rtni.test@regulatoryElements) ) ]	
+network.tfs$network.B <- rtni.validation@regulatoryElements[ match( network.tfs$hgnc_symbol, names(rtni.validation@regulatoryElements) ) ]	
+# write to file:
+outputname <- paste0( Sys.Date(), "_RTN_GBM_TFs_used_in_networks_A_and_B.csv" )
+write.csv(x=network.tfs, file=outputname)
+
+#############################################
+#
+# save the R objects generated in this analysis
+# and output session info
+#
+#############################################
+message("Saving a copy of R objects and session info...")
+# save the R objs generated
+save( gsea.res, gsea.res.table, gsea.tfs,
+	rtna.consensusGSEA.idh.test, rtna.consensusGSEA.mes.test, rtna.consensusGSEA.rtki.test, rtna.consensusGSEA.rtkii.test,
+	rtna.consensusGSEA.idh.validation, rtna.consensusGSEA.mes.validation, rtna.consensusGSEA.rtki.validation, rtna.consensusGSEA.rtkii.validation,
+	network.tfs,
+	file=paste(Sys.Date(), "_combined_GBM_RTN_GSEA_consensus_MR_heatmap_ResObj.Rdata", sep="")
+	)
+# output session info
+seshinf <- paste ( Sys.Date(), "_combined_GBM_RTN_GSEA_consensus_MR_heatmap_sessionInfo.txt", sep="" )
+writeLines( capture.output(sessionInfo()), seshinf )
+message("Finished!")

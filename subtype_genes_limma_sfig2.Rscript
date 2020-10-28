@@ -1,10 +1,21 @@
-#!/bin/R-3.4.2
+#!/bin/R-3.4.3
+
+########################################
 #
-# subtype_genes_limma.Rscript
+# subtype_genes_limma_sfig2.Rscript
 #
-# 20171219 v2 - update script to run on b06x cluster, R v3.4.2
-# 20170711 v1 - adapted from previous limmavoom_subtype_DEanalysis.Rscript
-# by Mike
+# Mike Fletcher
+# date
+#
+# R version used: 3.4.3
+#
+# (original name: subtype_genes_limma.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
 #
 # limma+voom differential expression analysis of HIPO016 RNAseq data
 # identify cancer subtype-specific genes by comparing them to all other cancer subtypes
@@ -12,6 +23,31 @@
 # on the FINALISED list of samples and their classifications (n=60)
 # and then also run on the CIMPneg subtypes only (n=50 samples)
 #
+########################################
+# INPUTS
+########################################
+#
+# needs the RNAseq raw counts matrix for those samples,
+# and a metadata sheet containing the sample AK IDs and subtypes (see Supplementary Table 1)
+#
+########################################
+# OUTPUTS
+########################################
+#
+# SUPPLEMENTARY FIGURE 2:
+#   plots (.pdf/.png) - for analysis QC, GX plots of top DEG, MDS of samples, Venn diagram of subtype gene list overlap, ...
+#
+# tables (.txt) - limma analysis results for each subtype; all genes and FDR filtered
+# R environment (.Rdata) - used in other analyses! - and session info (.txt)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# the analysis is very lightweight, so shouldn't need massive resources.
+#
+########################################
+
 #########################################################
 #
 # SETUP: funs, libs, output.dir etc
@@ -61,12 +97,6 @@ system2("mkdir", args=output.dir.tab)
 # per-gene plots for 4-subtype analysis
 output.dir.plot <- paste0(output.dir, "plots_genes/")
 system2("mkdir", args=output.dir.plot) 
-# tables for CIMPneg analysis
-output.dir.tab.cimpneg <- paste0(output.dir, "tables_degenes_CIMPneg/")
-system2("mkdir", args=output.dir.tab.cimpneg) 
-# per-gene plots for CIMPneg analysis
-output.dir.plot.cimpneg <- paste0(output.dir, "plots_genes_CIMPneg/")
-system2("mkdir", args=output.dir.plot.cimpneg) 
 # saved R objs, session info, etc.
 output.dir.objs <- paste0(output.dir, "R_objects/")
 system2("mkdir", args=output.dir.objs) 
@@ -258,6 +288,7 @@ vennDiagram( res2,
             cex=c(0.9, 0.75, 0.75) # change text char size
            )
 dev.off()
+
 ##########################################################################################
 ##########################################################################################
 #
@@ -267,7 +298,6 @@ dev.off()
 #
 ##########################################################################################
 ##########################################################################################
-
 # using res2 - global hypothesis testing adjustment, FDR<0.001
 message( "Outputting global expression data...")
 # output entire MArrayLM using 'write.fit' https://stat.ethz.ch/pipermail/bioconductor/2006-January/011656.html
@@ -399,8 +429,6 @@ write.table(limma.rtkii[limma.rtkii$adj.P.Val<0.001,], file=outputname, quote=F,
 #	- most sig. (adj p val) DEG
 #	- highest logFC DEG
 #
-# code based on ipynb from 20150311
-#
 ############################################################
 # plot for top10 by adjpval
 for ( subtype in c("IDH", "MES", "RTK_I", "RTK_II") )
@@ -499,11 +527,7 @@ for ( subtype in c("IDH", "MES", "RTK_I", "RTK_II") )
 
 ############################################################
 #
-#
 # PERFORM MDS ON DEG ONLY
-# 20150416 
-# code based on ipynb from 20150402
-#
 #
 ############################################################
 message( "Re-plotting MDS using DEG only...")
