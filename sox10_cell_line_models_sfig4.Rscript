@@ -1,11 +1,61 @@
-#!/bin/R
+#!/bin/R-3.5.1
 
-##### code to generate Sup Fig 4 plots of SOX10 methylation/expression in cell line models
+########################################
 #
-# code from ipynb 20190720
+# sox10_cell_line_models_sfig4.Rscript
+#
+# Mike Fletcher
+# 20201101
+#
+# R version used: 3.5.1
+#
+# (original name: adapted from ipynb 20190720)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# produces figures for Supplementary Figure 4:
+# GB cell line model data for SOX10 (used to select SOX10-high RTK_I-like cell lines)
+#
+# the input data is from Yonghe; he's generated two .csvs (see INPUTS)
+# containing the SOX10 probes from:
+#	- Affy GX microarrays
+#	- 450k/EPIC methylation microarrays (probes mapping to the SOX10 gene, location-wise)
+#
+########################################
+# INPUTS
+########################################
+# 
+# need two .csv files, for the panel of GBM cell lines:
+#	- SOX10_methylation_array_in_cell_lines_H016_20190720.csv
+#		methylation betas for 450k/EPIC array probes mapping to the SOX10 gene
+#	- SOX10_methylation_array_in_cell_lines_H016_20190720.csv
+#		GX values (Affy) for SOX10
+#
+########################################
+# OUTPUTS
+########################################
+#
+# SUPPLEMENTARY FIGURE 4:
+#	- heatmap of methylation for SOX10 probes (.pdf)
+#	- barplot of SOX10 gene expression (.pdf)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# tiny - loads a few (small) tables and makes some plots
+#
+########################################
 
-
-
+########################################
+#
+# START CODE
+#
+########################################
 # define location of working directory
 working.dir <- "20190720_pr001_GB_cell_lines_methylation_arrays_SOX10_info_for_SupFig/"
 
@@ -19,7 +69,6 @@ library(ComplexHeatmap)
 # check data
 meth
 
-
 # generate heatmap:
 #
 # define colours for methylation heatmap with 0 - 1.0 beta vals:
@@ -29,9 +78,6 @@ cols <- colorRampPalette(c("blue", "white", "red"))(100)
 mat <- as.matrix(t(meth[,-(1:3)]))
 colnames(mat) <- meth$probeID
 mat
-
-
-
 
 # produce heatmap:
 # use colours, titles, ...
@@ -50,8 +96,6 @@ pdf( paste0( working.dir, Sys.Date(), "_450k_EPIC_cell_line_SOX10_probes_heatmap
 ComplexHeatmap::draw( hm, heatmap_legend_side = "right", annotation_legend_side = "left")
 dev.off()
 
-
-
 # plot GX as barplots with SD:
 #
 # first do for the microarray data; coerce to a nice ggplot2-style thing
@@ -69,4 +113,3 @@ p
 pdf( paste0( working.dir, Sys.Date(), "_expression_microarray_cell_line_SOX10_expression.pdf"), width=8, height=6)
 p
 dev.off()
-

@@ -1,51 +1,60 @@
-#!/bin/R
+#!/bin/R-3.4.3
 
-####### code to produce Volcano plots of ATAC diffbound peak HOMER motifs
+########################################
 #
-# code from 20191108
-
-# b06x-cnt2
-# screen name: chip
-
-# request interactive session - small!
-# qsub -I -l walltime=2:00:00,mem=8g,nodes=1
-# load R v3.4.3: module load R-bundle/20171215-foss-2017a-R-3.4.3
+# sox10_kd_ATAC_HOMER_motif_Volcano_plot_fig4f_sfig6b.Rscript
+#
+# Mike Fletcher
+# 20201101
+#
+# R version used: 3.4.3
+#
+# (original name: sox10_kd_ATAC_HOMER_motif_Volcano_plot.Rscript; code from ipynb 20191108)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# produces Volcano plots of the HOMER motif finding results
+#	for the LN229, ZH487 cell lines
+#	up/down ATAC regions defined based on comparing shSOX10 vs NT using diffBind - from sox10_kd_ATAC_ChIPseq_analysis_fig4.Rscript
+#
+########################################
+# INPUTS
+########################################
+#
+# needs the HOMER motif finding output directories from sox10_kd_ATAC_HOMER_motif_finding_fig4f_sfig6b.sh
+#
+########################################
+# OUTPUTS
+########################################
+#
+# FIGURE 4F:
+#	Volcano plot of HOMER motif finding results, on the shSOX10/NT differentially accessible regions, for LN229 (.pdf)
+#
+# SUPPLEMENTARY FIGURE 6B:
+#	Volcano plot of HOMER motif finding results, on the shSOX10/NT differentially accessible regions, for ZH487 (.pdf)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# just making some plots, so very small res needed (8g, 1 core)
+#
+########################################
 
 #############################################
 #
-# setup
+# START CODE
 #
 #############################################
 # define #cores to parallelise over; set based on #cores requested for job
 n.cores <- 1
 
-# load libs for analysis:
-suppressMessages(library(viridis))
-# load Epik 
-#suppressMessages( library(epik) )
-# for differential binding analysis
-#suppressMessages( library(DiffBind) )
-# to install if needed:
-#source("https://bioconductor.org/biocLite.R")
-#biocLite("EnsDb.Hsapiens.v75")
-#
-# annotation libs:
-#suppressMessages( library(EnsDb.Hsapiens.v75) )
-#suppressMessages( library(TxDb.Hsapiens.UCSC.hg19.knownGene) )
+# load libs:
 suppressMessages( library(ggplot2) )
-suppressMessages( library(org.Hs.eg.db) )
-suppressMessages( library(reactome.db) )
-# ChIP analysis:
-suppressMessages( library(ChIPpeakAnno) )
-#library(DiffBind)
-# plotting and heatmaps
-suppressMessages( library(RColorBrewer) )
-suppressMessages( library(EnrichedHeatmap) )
-suppressMessages( library(circlize) )
-# parallelise some data loading functions
-#suppressMessages( library(parallel) )
-# RTN
-#suppressMessages(library(RTN))
 
 # load common HIPO016 analysis code...
 source("/home/fletcher/git_repos/gbm-master-regulators/gbm_hipo016_common.R")

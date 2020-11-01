@@ -1,48 +1,31 @@
 #!/bin/R-3.4.3
 
-# sox10_kd_limma_analysis.Rscript
+########################################
 #
-# v5 20200801 - stripped out a lot of code for unused results (e.g. mSigDB testing, MDS plots)
-#				remove the JQ1 experiments added 20190712/v3
-#				also added in code for revisions required for N Comms (cell line MR activity heatmap, more subtype sig Volcanoes)
-# v4 20190719 - add new ZH487 affy exp
-# v3 20190712 - add JQ1 treated cells to analysis
-# v2 20180116 - update for R v3.4.3
+# sox10_kd_expression_array_analysis_sfig5c.Rscript
 #
-# 20171127
-# Mike
+# Mike Fletcher
+# 20201101
+#
+# R version used: 3.4.3
+#
+# (original name: sox10_kd_limma_analysis.Rscript)
 #
 ########################################
 #
 # WHAT THIS DOES
 #
 ########################################
+#
 # run limma analysis on SOX10 KD data to identify the genes up/downregulated by SOX10 KD
 #
-# results are used in: SOX10 functional stuff, RTN network validation...
+# results are used in various places; e.g. 
+#	- the GSEA plots of SOX10 KD/control vs the GBM subtype signatures (Figs 5d, SFig 5b)
+#	- SOX10 gene expression used for cell line model selection (SFig 4; see sox10_cell_line_models_sfig4.Rscript)
 #
-# Analysis of four (!) separate experiments on two platforms:
+# Analysis of two (!) separate experiments on the same platform:
 #
-# 1. Illumina beadarray v4 - experiment 1
-# see ipynb 20160909
-# samplesheet: sample_sheet_yonghe_26.04.2016.csv 
-# several experiments to compare:
-#	(i) LN229 cells, KD SOX10 with constitutive shRNA
-#	(ii) LN229 cells, KD SOX10 with 7d of dox-induced shRNA
-#	(iii) NCH421k cells, KD SOX10 with constitutive shRNA
-# variable number of control/treated cells (with different shRNAs)
-#
-# 2. Illumina beadarray v4 - experiment 2
-# see ipynb 20190712
-# samplesheet: sample_sheet_yonghe_19.06.2019.csv
-# experiments as follows:
-#	(i) LN229 cells, KD SOX10 with dox-induced shRNA and JQ1 for either 7d or 10d (does JQ1 block the MES transition?)
-#	(ii) LN229 cells, KD SOX10 with 10d and then withdrawal of dox (do the cells return to a RTK_I state?)
-#	(iii) U3047 cells, KD SOX10 with constitutive shRNA
-#	(iv) ZH487 cells, KD SOX10 with JQ1 treatment, with constitutively expressed shRNAs (for GSEA of the transition)
-# variable number of control/treated cells (with different shRNAs)
-#
-# 3. Affy arrays, HG U133 Plus2 - experiment 1
+# 1. Affy arrays, HG U133 Plus2 - experiment 1
 # see ipynb 20170131
 # samplesheet: sample_sheet_yonghe_16.11.2016.csv
 # two experiments to compare
@@ -50,57 +33,55 @@
 #	(ii) ZH487 cells, KD SOX10 with shRNA
 # each experiment has 2 control samples (mock and NT) and 3 KD samples (with 3 different sgRNAs or shRNAs)
 #
-# 4. Affy arrays, HG U133 Plus2 - experiment 2
+# 2. Affy arrays, HG U133 Plus2 - experiment 2
 # see ipynb 20190719
 # samplesheet: sample_sheet_yonghe_18.06.2019.csv
 # one experiment: 
 #     (i) ZH487 cells, KD SOX10 with shRNA
 # this experiment has 2 control samples (mock and NT) and 3 KD samples (with 3 different sgRNAs or shRNAs)
-# combine this data with the ZH487 from 3.; need to account for batch effects.
+# combine this data with the ZH487 from 3.; need to account for batch effects with ComBat!
 #
 ########################################
-#
-# LOCATIONS - input files, etc.
-#
+# INPUTS
 ########################################
 #
-# use as analysis dir: /icgc/dkfzlsdf/analysis/hipo/hipo_016/sox10_KD_microarray/
-# contains samplesheets named above
+# needs the gene expression microarray (Affy) raw data for the LN229, ZH487 cell lines 
+#	with SOX10 knockdown (for LN229, dox-inducible CRISPRi; for ZH486, constitutive shRNA)
 #
-# raw input microarray data in subdir ./data/
+# also targets samplesheets (Affy GX array analysis-style) 
+#
+# data is on the GEO: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE121718
+#
+# need the RTN network A as well (for MR activity inference) - output of rtn_analysis_01_run_rtn.Rscript
+# and the Wang 2017 paper's subtype genes - from https://doi.org/10.1016/j.ccell.2017.06.003
 #
 ########################################
-#
 # OUTPUTS
-#
 ########################################
 #
-# to newly-created analysis subdir ./ANALYSISDATE_limma_analysis/
-#
-# for each experiment SEPARATELY:
-#
-# various plots, DEG tables, etc. 
-# Volcano plots showing the 2017 PN/MES/CL and our RTK_I/MES/RTK_II signature genes between NT/KD
+# from the limma DEG analysis, for the two cell line models, separately:
+#	- MDS plots (.pdf) showing effect of ComBat batch removal on the ZH487 samples
+#	- various QC plots, limma DEG results tables, etc. 
+#	- Volcano plots showing the 2017 PN/MES/CL and our RTK_I/MES/RTK_II signature genes between NT/KD
 # 
-# also a MR activity heatmap (RTN netA/test, using VIPER) for the CRC MES/RTK_I MRs 
+# SUPPLEMENTARY FIGURE 5C:
+# 	MR activity heatmap (RTN netA/test, using VIPER) for the CRC MES/RTK_I MRs (.pdf)
+#
+# R environment (.Rdata) and session information (.txt) also saved.
 #
 ########################################
-#
-# CLUSTER JOB 
-#
+# RESOURCE USAGE
 ########################################
 #
-# interactive job request with mem
-#	qsub -I -l walltime=00,mem=32g,nodes=1:ppn=1
-#    
-# load R 3.4.3    
-#	module load R-bundle/20171215-foss-2017a-R-3.4.3    
+# this is a small limma analysis (n=15 samples) so, yeap, you guessed it, quite lightweight
 #
-################################################################################
+########################################
+
+########################################
 #
 # start code
 #
-################################################################################
+########################################
 #
 # setup: load libraries
 #
@@ -113,10 +94,6 @@ suppressMessages( library(gcrma) )
 # for the arrays: get probe -> entrezID/symbol mappings
 # for HG-U133-Plus2 arrays
 suppressMessages( library(hgu133plus2.db) )
-# human HT-12 v4 array annotation file; install if needed from
-#source("http://bioconductor.org/biocLite.R")
-#biocLite("illuminaHumanv4.db")
-suppressMessages( library(illuminaHumanv4.db) )
 # for gene set enrichment testing
 suppressMessages( library(ReportingTools) )
 suppressMessages( library(GSEABase) )
@@ -292,33 +269,6 @@ dev.off()
 # and continue the analysis...
 gx.filt.affy <- gx.filt.affy[ match(rownames(gx.filt.affy.zh), rownames(gx.filt.affy)), ]
 gx.filt.affy[ , match(colnames(gx.filt.affy.zh), colnames(gx.filt.affy) ) ] <- gx.filt.affy.zh
-#
-#
-########################################
-#
-# Illumina setup for 1st experiment: read in data, targets, take LN229 samples
-#
-########################################
-# read in targets from sample sheet for 1st experiment
-targets.ilmn <- readTargets( file="./data/sample_sheet_yonghe_26.04.2016.csv", sep=",", skip=11 )
-
-# read in raw probe intensities exported from GenomeStudio (see ipynb 20160909 for details)
-# options: use "," as decimal point (we're in germany)
-gx.ilmn <- read.ilmn( files="sample_probe_profile_missing_imputed.txt", 
-                     ctrlfiles="control_probe_profile_missing_imputed.txt", 
-                     path="./data/20160909_FletcherMichael/",
-                     dec=",")
-
-# now: take only the LN229 samples forward into analysis, based on the Sample_Name in targets
-keep.samples <- grep(x=targets.ilmn$Sample_Name, pattern="LN229")
-# filter targets (by row) and gx (by col)
-targets.ilmn <- targets.ilmn[ keep.samples, ]
-gx.ilmn <- gx.ilmn[ , keep.samples ]
-
-# build annotation dataframe containing: ENTREZ IDs, gene symbols + probe IDs.
-# add to featureData slot of gx eSet:
-array.anno.ilmn <- cbind( as.data.frame( illuminaHumanv4ENTREZID ), symbol=as.data.frame( illuminaHumanv4SYMBOL )$symbol )
-# gives 34000 probes/rows (n.b. some genes have multiple probes)
 
 ########################################
 #
@@ -337,43 +287,9 @@ png( paste( output.dir, "/", Sys.Date(), "_affy_02_MDS_expressed_probes.png", se
 plotMDS( gx.filt.affy, labels=colnames(gx.filt.affy) )
 dev.off()
 
-############
-# Illumina:
-############
-# make boxplot of raw intensities
-# do for the 2 experiments separately
-png( paste( output.dir, "/", Sys.Date(), "_ilmn_01_raw_log2_probe_intensities_exp1.png", sep="") )
-boxplot(log2(gx.ilmn$E),range=0,ylab="log2 intensity")
-dev.off()
-
-# do background correction and normalisation
-y.ilmn <- neqc(gx.ilmn)
-# also automatically removes the control probes
-
-# plot background corrected + normalised intensities
-png( paste( output.dir, "/", Sys.Date(), "_ilmn_02_BC_norm_log2_probe_intensities_exp1.png", sep="") )
-boxplot(log2(y.ilmn$E),range=0,ylab="log2 intensity (background-corrected and normalised)")
-dev.off()
-
-# now filter out probes that aren't expressed according to detection pvals
-#
-# take probes with pval < 0.01 in >3 samples
-expressed <- rowSums(y.ilmn$other$Detection < 0.01) >= 3
-y.ilmn <- y.ilmn[expressed,]
-dim(y.ilmn)
-# leaves 15454 probes in exp1
-
-# plot MDS of samples; label points with sample names
-png( paste( output.dir, "/", Sys.Date(), "_ilmn_03_MDS_expressed_probes.png", sep="") )
-plotMDS( y.ilmn, labels=targets.ilmn$Sample_Name )
-dev.off()
-#
-# pretty clear split of conditions...!
-#
-#
 ########################################
 #
-# Both platforms, separately: build model matrix
+# build model matrix
 #
 ########################################
 # Affy
@@ -398,26 +314,6 @@ f.affy <- factor( c("nokd", "nokd", "kd", "kd", "kd", # LN229 CRISPRi
 # design matrix
 design.affy <- model.matrix( ~0 + f.affy )
 colnames(design.affy) <- levels(f.affy)
-
-############
-# Illumina
-############
-# we have the following sample names:
-#
-#targets.ilmn$Sample_Name
-# [1] "LN229_NT"               "LN229_sh1"              "LN229_sh2"
-# [4] "LN229_sh3"              "LN229_7d_NT"            "LN229_7d_NT_Dox"
-# [7] "LN229_7d_sh2"           "LN229_7d_sh2_Dox"      
-#
-
-# so build a factor vector for the sample conditions:
-f.ilmn.ln <- factor( c("NT", "shSOX10", "shSOX10", "shSOX10", # constitutive shRNAs + control
-                       "NT", "NT", "NT", "shSOX10"), # dox_inducible shRNA + controls
-					levels=c("NT", "shSOX10") )
-
-# design matrix from the factor vectors
-design.ilmn.ln <- model.matrix( ~0 + f.ilmn.ln )
-colnames(design.ilmn.ln) <- levels(f.ilmn.ln)
 
 ########################################
 #
@@ -528,49 +424,10 @@ write.table( x=toptable.affy.zh[ toptable.affy.zh$adj.P.Val < 0.05, ], file=outp
 
 ########################################
 #
-# 3. in Illumina experiment 1 - LN229, both constitutive+inducible shRNA together
-#
-########################################
-#
-# fit linear models based on design matrix
-# take first 8 samples = exp1, first two columns of design = NT/shSOX10
-fit.ilmn <- lmFit( y.ilmn, design.ilmn.ln )
-
-# build contrast matrix
-# compare KD vs no KD
-cont.matrix.ilmn.ln <- makeContrasts(
-     kd.vs.nokd = shSOX10 - NT,
-     levels=design.ilmn.ln)
-
-# fit contrast matrix and do eBayes
-fit2.ilmn <- contrasts.fit(fit.ilmn, cont.matrix.ilmn.ln)
-fit2.ilmn <- eBayes(fit2.ilmn)
-
-# find DEG
-results.ilmn <- decideTests(fit2.ilmn)
-# using default pvalue threshold of 0.05 (if lowered to 0.01 you get ~50 DEG...!)
-
-# output "venn diagram" of the one contrast (hur)
-png( paste( output.dir, "/", Sys.Date(), "_ilmn_04_venn_DE_genes.png", sep="") )
-vennDiagram(results.ilmn)
-dev.off()
-
-# output DEG tables, containing logFC + pvals, etc.
-#
-# extract to df
-toptable.ilmn <- topTable( fit2.ilmn, n=Inf, sort.by="p" )
-# do for all genes 
-outputname <- paste( output.dir, "/", Sys.Date(), "_ilmn_LN229_exp1_SOX10_KD_results_allgenes.txt", sep="" )
-write.table( x=toptable.ilmn, file=outputname, sep="\t", quote=F, row.names=F )
-# do for DEG @ adj pval < 0.05
-outputname <- paste( output.dir, "/", Sys.Date(), "_ilmn_LN229_exp1_SOX10_KD_results_adjPval_0.05.txt", sep="" )
-write.table( x=toptable.ilmn[ toptable.ilmn$adj.P.Val < 0.05, ], file=outputname, sep="\t", quote=F, row.names=F )
-
-########################################
-#
 # produce Volcano plots for each experiment (LN229 sh (cons+induc together), LN229 CRISPRi, ZH487 sh), 
+# using the limma results
 #
-# for the TCGA-defined PN, MES CL; and our RTK_I, MES, RTK_II subtype gene signatures
+# labelling the Wang 2017 PN, MES genes
 #
 # use ggplot2.
 #
@@ -578,7 +435,7 @@ write.table( x=toptable.ilmn[ toptable.ilmn$adj.P.Val < 0.05, ], file=outputname
 # set stringsAsFactors=F for loading these tables
 options(stringsAsFactors=F)
 
-# TCGA-defined PN/MES/CL genes, from Wang 2017 3-subtype classification
+# PN/MES/CL genes, from Wang 2017 3-subtype classification
 # use Zuguang's files
 path.tcga.sigs.2017 <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/sox10_KD_microarray/data/gbm_2017.txt"
 # 4-column tab-delim text: gene symbol, MES expr, CL expr, PN expr (logFC values)
@@ -712,7 +569,6 @@ pdf(outputname, height=5, width=5)
 p
 dev.off()
 
-
 ########################################
 # now: plot for ZH487, affy experiment (Constitutive shRNA)
 #
@@ -817,121 +673,12 @@ pdf(outputname, height=5, width=5)
 p
 dev.off()
 
-########################################
-# now: plot for LN229, Illumina experiment (constitutive and inducible shRNAs)
-#
-# set same plot x/ylims
-########################################
-# 2017 TCGA sig genes:
-# first, MES/RTK_I (=PN)
-toptable.ilmn$tcga.sig.2017 <- vector(mode="character", length=nrow(toptable.ilmn))
-toptable.ilmn$tcga.sig.2017[toptable.ilmn$SYMBOL %in% sig.genes.tcga$MES_2017] <- "MES"
-toptable.ilmn$tcga.sig.2017[toptable.ilmn$SYMBOL %in% sig.genes.tcga$PN_2017] <- "PN"
-toptable.ilmn$tcga.sig.2017[toptable.ilmn$tcga.sig.2017 == ""] <- "none"
-# coerce to a factor so can use it with ggplot2:
-toptable.ilmn$tcga.sig.2017 <- factor(toptable.ilmn$tcga.sig.2017)
-
-# add in column with -log10 adj p-val for the Volcano
-toptable.ilmn$minus.log10.adj.P.Val <- -log10(toptable.ilmn$adj.P.Val)
-
-# plotting for the signature genes only
-outputname <- paste0( output.dir, Sys.Date(), "_ilmn_04_LN229_shRNA_VolcanoPlot_TCGAgenes2017_PN-MES_only.pdf", sep="" )
-plot.title <- "SOX10 knockdown versus control\nshRNA in LN229 - Illumina HumanHT-12 v4\n2017 TCGA PN/MES genes only"
-# generate plot
-p <- ggplot( data=toptable.ilmn[toptable.ilmn$tcga.sig.2017!="none",], aes(x=logFC, y=minus.log10.adj.P.Val) ) + 
-# for point geom: set fill to the 2010 TCGA sig genes, change point size
-geom_point(aes(colour=tcga.sig.2017), size=2) +
-scale_colour_manual( values=c(none="grey", MES="#377eb8", PN="#4daf4a") ) + # set colour manually 
-ggtitle(plot.title) + ylab("-log10( BH adjusted p-value )") + xlab("logFC (SOX10 KD vs control)") + # add title, axis labels
-ylim(0,3) + xlim(-3,3) # set axis lims
-# output plot
-pdf(outputname, height=5, width=5)
-p
-dev.off()
-
-# then, RTK_II/RTK_I (=CL/PN)
-toptable.ilmn$tcga.sig.2017 <- vector(mode="character", length=nrow(toptable.ilmn))
-toptable.ilmn$tcga.sig.2017[toptable.ilmn$SYMBOL %in% sig.genes.tcga$CL_2017] <- "CL"
-toptable.ilmn$tcga.sig.2017[toptable.ilmn$SYMBOL %in% sig.genes.tcga$PN_2017] <- "PN"
-toptable.ilmn$tcga.sig.2017[toptable.ilmn$tcga.sig.2017 == ""] <- "none"
-# coerce to a factor so can use it with ggplot2:
-toptable.ilmn$tcga.sig.2017 <- factor(toptable.ilmn$tcga.sig.2017)
-
-# plotting for the signature genes only
-outputname <- paste0( output.dir, Sys.Date(), "_ilmn_04_LN229_shRNA_VolcanoPlot_TCGAgenes2017_PN-CL_only.pdf", sep="" )
-plot.title <- "SOX10 knockdown versus control\nshRNA in LN229 - Illumina HumanHT-12 v4\n2017 TCGA PN/CL genes only"
-# generate plot
-p <- ggplot( data=toptable.ilmn[toptable.ilmn$tcga.sig.2017!="none",], aes(x=logFC, y=minus.log10.adj.P.Val) ) + 
-# for point geom: set fill to the 2010 TCGA sig genes, change point size
-geom_point(aes(colour=tcga.sig.2017), size=2) +
-scale_colour_manual( values=c(none="grey", CL="#984ea3", PN="#4daf4a") ) + # set colour manually 
-ggtitle(plot.title) + ylab("-log10( BH adjusted p-value )") + xlab("logFC (SOX10 KD vs control)") + # add title, axis labels
-ylim(0,3) + xlim(-3,3) # set axis lims
-# output plot
-pdf(outputname, height=5, width=5)
-p
-dev.off()
-
-##########
-# do for our subtype sig genes:
-##########
-# first, RTK_I/MES
-toptable.ilmn$gbm.sig <- vector(mode="character", length=nrow(toptable.ilmn))
-toptable.ilmn$gbm.sig[toptable.ilmn$SYMBOL %in% sig.genes.gbm$MES] <- "MES"
-toptable.ilmn$gbm.sig[toptable.ilmn$SYMBOL %in% sig.genes.gbm$RTK_I] <- "RTK_I"
-toptable.ilmn$gbm.sig[toptable.ilmn$gbm.sig == ""] <- "none"
-# coerce to a factor so can use it with ggplot2:
-toptable.ilmn$gbm.sig <- factor(toptable.ilmn$gbm.sig)
-
-# try plotting for the signature genes only
-outputname <- paste0( output.dir, Sys.Date(), "_ilmn_04_LN229_shRNA_VolcanoPlot_limma_subtype_genes_RTK_I-MES_only.pdf", sep="" )
-plot.title <- "SOX10 knockdown versus control\nCRISPRi in LN229 - Affymetrix HG U133 Plus2\nlimma RTK_I/MES genes only"
-# generate plot
-p <- ggplot( data=toptable.ilmn[toptable.ilmn$gbm.sig!="none",], aes(x=logFC, y=minus.log10.adj.P.Val) ) + 
-# for point geom: set fill to the 2010 TCGA sig genes, change point size
-geom_point(aes(colour=gbm.sig), size=0.2) +
-scale_colour_manual( values=c(none="grey", MES="#377eb8", RTK_I="#4daf4a") ) + # set colour manually 
-ggtitle(plot.title) + ylab("-log10( BH adjusted p-value )") + xlab("logFC (SOX10 KD vs control)") + # add title, axis labels
-ylim(0,3) + xlim(-5,5) # set axis lims
-# output plot
-pdf(outputname, height=5, width=5)
-p
-dev.off()
-
-# also PN/CL (=RTK_II)
-toptable.ilmn$gbm.sig <- vector(mode="character", length=nrow(toptable.ilmn))
-toptable.ilmn$gbm.sig[toptable.ilmn$SYMBOL %in% sig.genes.gbm$RTK_II] <- "RTK_II"
-toptable.ilmn$gbm.sig[toptable.ilmn$SYMBOL %in% sig.genes.gbm$RTK_I] <- "RTK_I"
-toptable.ilmn$gbm.sig[toptable.ilmn$gbm.sig == ""] <- "none"
-# coerce to a factor so can use it with ggplot2:
-toptable.ilmn$gbm.sig <- factor(toptable.ilmn$gbm.sig)
-
-# try plotting for the signature genes only
-outputname <- paste0( output.dir, Sys.Date(), "_ilmn_04_LN229_shRNA_VolcanoPlot_limma_subtype_genes_RTK_I-RTK_II_only.pdf", sep="" )
-plot.title <- "SOX10 knockdown versus control\nCRISPRi in LN229 - Affymetrix HG U133 Plus2\nlimma RTK_I/RTK_II genes only"
-# generate plot
-p <- ggplot( data=toptable.ilmn[toptable.ilmn$gbm.sig!="none",], aes(x=logFC, y=minus.log10.adj.P.Val) ) + 
-# for point geom: set fill to the 2010 TCGA sig genes, change point size
-geom_point(aes(colour=gbm.sig), size=0.2) +
-scale_colour_manual( values=c(none="grey", RTK_I="#4daf4a", RTK_II="#984ea3") ) + # set colour manually 
-ggtitle(plot.title) + ylab("-log10( BH adjusted p-value )") + xlab("logFC (SOX10 KD vs control)") + # add title, axis labels
-ylim(0,3) + xlim(-5,5) # set axis lims
-# output plot
-pdf(outputname, height=5, width=5)
-p
-dev.off()
-
 #############################################
 #
-# 20200802 NEW: add in the code for the MR activity heatmap in these SOX10 KD cell line experiments.
-#	from ipynb 20190729
-#  also as per reviewers' comment add in statistical testing.
+# code for the MR activity heatmap in these SOX10 KD cell line experiments.
+# from ipynb 20190729
+# as per reviewers' comment, add in statistical testing
 #
-#############################################
-# set working dir
-#dir.working <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/chipseq_sox10_kd/"
-#setwd(dir.working)
-
 #############################################
 # VIPER: generate regulons
 #############################################

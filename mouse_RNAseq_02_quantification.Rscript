@@ -1,0 +1,176 @@
+#!/bin/R-3.4.3
+
+########################################
+#
+# mouse_RNAseq_02_quantification.Rscript
+#
+# Mike Fletcher
+# 20201101
+#
+# R version used: 3.4.3
+#
+# (original name: RNAseq_Angel_GB_GEMM_SOX10_manuscript_GX_quantification.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# produces a TPM table for the mouse RNAseq data 
+#
+########################################
+# INPUTS
+########################################
+#
+# takes the featureCounts-output reads-against-transcriptome features (aligned against Gencode vM2)
+#
+# also adds in the human homologue genes, as defined by JAX:
+#	http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt
+#
+########################################
+# OUTPUTS
+########################################
+#
+# tables (.txt) of raw counts (from STAR) and TPMs (calculated here); with human homologue genes
+#
+# R environment (.Rdata), session information (.txt)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# just loading some sample counts files, so not big at all
+#
+########################################
+
+########################################
+# 
+# START CODE
+#
+########################################
+# load libraries
+message( "\nLoading libraries...\n")
+suppressMessages( library("AnnotationDbi") )
+suppressMessages( library("org.Hs.eg.db") )
+suppressMessages( library(org.Mm.eg.db) )
+#suppressMessages( library(GSVA) ) # GSVA needed for Cahoy signatures
+#suppressMessages( library(GSVAdata) ) 
+#suppressMessages( library(ggplot2) )
+#suppressMessages( library(estimate) )
+#suppressMessages( library(clusterProfiler) )
+#suppressMessages( library(edgeR) )
+
+################
+#
+# RESOURCES
+#
+# set analysis dir as working dir
+analysis.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/rna_sequencing_angel_gemm/"
+setwd(analysis.dir)
+
+# load Gencode annotation used:
+path.mouse.gencode <- "/icgc/ngs_share/assemblies/mm10/databases/gencode/gencodeM2/gencode.vM2.annotation_plain.gtf"
+gencode <- rtracklayer::import(con=path.mouse.gencode, format="GFF")
+# for expression values calculate length of each gene's exons
+# get exons only:
+gencode <- gencode[ gencode$type=="exon" ] 
+# generate df with 2 columns: (1) gene ID and (2) exon length:
+gencode.lengths <- data.frame( gene_id=gencode$gene_id, length=width(gencode) )
+# now use dplyr to calculate sum for each gene ID:
+gencode.lengths <- dplyr::group_by( gencode.lengths, gene_id )
+gencode.lengths <- dplyr::summarise(gencode.lengths, length=sum(length) )
+# add in gene names:
+gencode.lengths$symbol <- gencode$gene_name[ match( gencode.lengths$gene_id, gencode$gene_id ) ]
+
+# read in metadata tsv:
+metadata <- read.table("./16613_meta.tsv", sep="\t", header=TRUE, stringsAsFactors=F)
+
+# remove the "Undetermined_1.fastq.gz" samples from analysis
+metadata <- metadata[!grepl(pattern="Undetermined_1.fastq.gz", x=metadata$FASTQ_FILE),]
+
+################################################################
+#
+# LOAD AND PROCESS GENE EXPRESSION DATA
+#
+################################################################
+# load GX: get all featureCounts files 
+# generate paths by listing everything in the counts subdir, and then getting the ".gencodevM2.featureCounts.txt" files
+res.fc <- list.files(paste0(getwd(), "/counts/"), recursive=T)
+res.fc <- paste0(getwd(), "/counts/", res.fc[ grepl(pattern=glob2rx("*.gencodevM2.featureCounts.txt$"), x=res.fc) ])
+
+# read all the featureCounts counts in as a matrix
+# each file is a tab-delim table with a # header; counts for the sample are in the 7th col
+mat.counts <- sapply( X=res.fc, function(x) read.table(file=x, sep="\t", header=T, quote="", comment.char = "#")[,7])
+
+# get colnames (sample IDs) from metadata: first convert colnames (currently /path/to/counts.txt)
+# to the "AS-*_R1.fastq.gz" ID - the 9th field in the colnames - (to match the FASTQ_FILE in metadata)
+colnames(mat.counts) <- paste0( sapply(X=strsplit(colnames(mat.counts), split="/"), "[", 9), "_R1.fastq.gz" )
+colnames(mat.counts) <- metadata$SAMPLE_ID[ match( colnames(mat.counts), metadata$FASTQ_FILE ) ]
+
+# add row names (ENSG IDs with gene symbols):
+# get ENSG IDs from first column of one of the counts files
+rownames(mat.counts) <- read.table(file=res.fc[1], sep="\t", header=T, quote="", comment.char = "#")[,1]
+
+###################
+# calculate TPM:
+###################
+#
+# formula: 
+# TPM = ( count x 1e6 ) / (sum all length-norm counts x length(kbp) )
+#
+# so first: calculate length-norm counts
+tpm <- mat.counts / gencode.lengths$length[match( rownames(mat.counts), gencode.lengths$gene_id )]
+# calculate sum of these:
+tpm.sums <- colSums(tpm)
+
+# now: transform length-norm counts
+# multiply by 1e6 and divide by scaling factor
+tpm <- 1e6 * tpm
+for (i in 1:ncol(tpm) )
+{
+  tpm[,i] <- tpm[,i] / tpm.sums[i]
+}
+
+###################
+# add additional gene information:
+###################
+# first coerce to df
+tpm <- as.data.frame(tpm)
+# add gene symbol, gene ty pe from transcriptome reference:
+tpm$symbol <- gencode$gene_name[ match( rownames(tpm), gencode$gene_id ) ]
+tpm$gene_type <- gencode$gene_type[ match( rownames(tpm), gencode$gene_id ) ]
+
+# add human homologues:
+# get homology tabel from http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt
+# in /icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/annotation/
+# so read in as tab-delim txt:
+df.homologues <- read.table(file="/icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/annotation/HOM_MouseHumanSequence.rpt",
+                           sep="\t", header=T, quote="",stringsAsFactors=F)
+
+# now: take human gene symbols, look up the "HomoloGene.ID" for each, and retrieve mouse symbols based on that:
+tpm$homologene.ids <- df.homologues$HomoloGene.ID[ match( tpm$symbol, df.homologues$Symbol)]
+# now add in the human symbols:
+tpm$symbol_human <- df.homologues$Symbol[df.homologues$Common.Organism.Name=="human"][ match(tpm$homologene.ids, df.homologues$HomoloGene.ID[df.homologues$Common.Organism.Name=="human"]) ]
+
+###################
+# output!
+###################
+# define output dir: analysis dir /icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/rna_sequencing_angel_gemm/
+path.outputdir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/rna_sequencing_angel_gemm/"
+# TPM
+# define output name:
+outputname <- paste( path.outputdir, "Angel_GB_GEMMs_SOX10_manuscript_mm10_Gencode_gene_expression_TPM_", Sys.Date(), ".csv", sep="" )
+write.csv( x=tpm, file=outputname )
+
+# also output raw counts:
+outputname <- paste( path.outputdir, "Angel_GB_GEMMs_SOX10_manuscript_mm10_Gencode_gene_expression_counts_", Sys.Date(), ".csv", sep="" )
+write.csv( x=data.frame(mat.counts), file=outputname )
+
+# finally: save env as a Rdata object also
+outputname <- paste( path.outputdir, "Angel_GB_GEMMs_SOX10_manuscript_mm10_Gencode_gene_expression_Renv_", Sys.Date(), ".Rdata", sep="" )
+save.image( file=outputname )
+
+# session info
+seshinf <- paste ( path.outputdir, Sys.Date(), "_Mouse_glioma_mm10_Gencode_GX_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)

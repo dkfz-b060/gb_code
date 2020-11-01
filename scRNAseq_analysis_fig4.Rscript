@@ -1,30 +1,88 @@
 #!/bin/R-3.5.1
+
+########################################
 #
-# scRNAseq_Darmanis_pseudotime.Rscript
+# scRNAseq_analysis_fig4.Rscript
 #
-# 20190329 - big update: improve subtyping of cells, add netB to regulon analysis
-# 20190225 v1 - first version of script
+# Mike Fletcher
+# 20201101
 #
-# pseudotime analysis of the Darmanis (2017) GB scRNAseq data set
+# R version used: 3.5.1
+#
+# (original name: scRNAseq_Darmanis_pseudotime.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# monocle pseudotime analysis of the Darmanis (2017) GB scRNAseq data set
+#
 # manuscript: https://www.cell.com/cell-reports/pdf/S2211-1247(17)31462-6.pdf
 # raw data accession: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE84465
 # 
 # WHAT THIS DOES: takes the Darmanis raw read matrix, 
-# loads into monocle, process/normalise;sen do pseudotime analysis on all cells (tumour+normal)
+#   loads into monocle, process/normalise/filter cells; 
+#   do pseudotime analysis on all cells (tumour+normal) using monocle
 #
-# then plot subtype and Master Regulator expression on the pseudotime trajectory,
-# to show the association between subtype and MR activity
+#   then plot subtype and Master Regulator expression on the pseudotime trajectory,
+#   to show the association between subtype and MR activity
 #
-#########################################################
+#   decompose the mixed (MES/microglia) state 5 into two branches based on MR activity matrix
+#   show that the two populations appear to be tumour and immune cells and are clearly distinct.
+#		(also BONUS unused code to do the same for the RTK_I state 1)
 #
-# cluster settings
+########################################
+# INPUTS
+########################################
 #
-#########################################################
+# from the Darmanis paper, need two things as .csv files:
+#   	raw gene-level counts matrix of 23368 genes x 3589 cells - GBM_raw_gene_counts.csv
+#       cell metadata sheet, 3589 cells/rows x 29 annotations/columns - GBM_metadata.csv
 #
-# request interactive job, plenty of mem/cpu 
-#       qsub -I -l walltime=24:00:00,mem=256g,nodes=1:ppn=32
-# load R v3.5.1: module load R-bundle/20180906-foss-2017a-R-3.5.1
+# from our various analyses:
+#		the RTN network A from rtn_analysis_01_run_rtn_sfig3a.Rscript
 #
+# the Gencode (v19) transcriptome reference - loaded as a GRanges object
+#
+# brain cell signature genes from McKenzie et al., a recent metanalysis paper:
+# 	https://www.nature.com/articles/s41598-018-27293-5 - look in the supplementary tables, sheet "top_human_enrich"
+#
+########################################
+# OUTPUTS
+########################################
+#
+# - from the basic monocle analysis: QC plots, effect of covariate removal, pseudotime, etc. etc. (.pdf)
+# - also lots of other plots of gene expression, MR activity, etc. in this dataset (.pdf)
+# - RTK_I state branch decomposition using RTK_I MRs (as done for the MES state) (.pdf)
+#
+# FIGURE 4:
+#	- Fig 4A: pseudotime trajectory, coloured by annotated cell state and study sample ID (.pdf)
+#	- Fig 4B: cell signatures: (.pdf)
+#			scores for normal brain cell signaturess from the McKenzie study 
+#			GB subtyping based on CRC MR VIPER-inferred activity
+#	- Fig 4C: pseudotime trajectory, coloured by subtype MR activity (SREBF1, CEBPA, SOX10, NR3C1) (.pdf)
+#	- Fig 4D: MR activity heatmap (from network A), split by pseudotime state (.pdf)
+#	- Fig 4E: MES/microglia state decomposition tSNEs, (.pdf)
+#			coloured by microglia marker gene expression (AIF1/Iba1, PTPRC)
+#			coloured by MES MR activity (FLI1, STAT3)
+#
+# and the R environment (.Rdata) and session information (.txt)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# this is a large(ish) scRNAseq dataset so will require a decent amount of memory
+#
+# per-cell gene signature scoring is very slow, so it's parallelised in the code
+#
+# when I ran it I used 256gig mem (but the parallelisation is very mem-hungry depending on #cores)
+# and 32 cores; and it still takes a couple of hours (!)
+#
+########################################
+
 #########################################################
 #
 # SETUP: funs, libs, working directory, etc
@@ -389,8 +447,6 @@ for( g in genes.to.plot )
 ##########################################################################################
 ##########################################################################################
 #
-# NEW NEW NEW 20190328
-#
 # now for each cell: subtype based on our GX signatures from limma analysis
 # use the UP-REGULATED genes in each subtype (as that's what other people do right, ha)
 #
@@ -653,7 +709,7 @@ setwd("/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/scRNAseq_Darmanis_2017/")
 path <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/analysis/scRNAseq_Darmanis_2017/CRC_MRs_20200821.csv"
 df.mrs <- read.csv(path)
 # check dims:
-dim(df.mrs) # should be 38 MRs with 2 columns (symbol + subtype)
+dim(df.mrs) # should be 37 MRs with 2 columns (symbol + subtype)
 # take CIMP- only, i.e., remove the IDH MRs:
 df.mrs <- df.mrs[ df.mrs$subtype != "IDH", ]
 
@@ -826,48 +882,11 @@ write.table(x=regulons.test.3col, file="./GBM_networkA_ARACNe.adj", quote=FALSE,
 reg.viper.test <- aracne2regulon("./GBM_networkA_ARACNe.adj", exp.test, format='3col')
 
 ##############################
-# validation/network B:
-##############################
-## Extract the regulons
-regulons.validation <- tni.get(rtni.validation,what='regulons')
-tf.symb <- convertIDs(names(regulons.validation),from='PROBEID',to='SYMBOL', hgu133plus2.db, ifMultiple = 'useFirst')
-names(regulons.validation) <- tf.symb
-## extract the matrix with the MI values
-tnet.validation <- tni.get(rtni.validation,what='tnet')
-symb.row <- convertIDs(rownames(tnet.validation),from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
-symb.col <- convertIDs(colnames(tnet.validation),from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
-colnames(tnet.validation) <- symb.col
-rownames(tnet.validation) <- symb.row
-# get expression matrix
-exp.validation <- tni.get(rtni.validation,what='gexp')
-# fix rownames = map from probe ID to symbol
-symb.row <- convertIDs(rownames(exp.validation),from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
-rownames(exp.validation) <- symb.row
-# convert the MI matrix to an ARACNe-format adjacency list
-regulons.validation.3col <- do.call('rbind', lapply( names(regulons.validation) ,function(tf) {
-  message(tf)
-  targets = regulons.validation[[tf]]
-  targets.symb = convertIDs(targets,from='PROBEID',to='SYMBOL',hgu133plus2.db,ifMultiple = 'useFirst')
-  i = match(targets.symb,rownames(tnet.validation))
-  j = match(tf,colnames(tnet.validation))
-  mi = tnet.validation[i,j]
-  names(mi) = NULL
-  data.frame(tf=rep(tf,length(targets)),targets=targets.symb,mi=mi)
-}))
-regulons.validation.3col[,3] <- abs(regulons.validation.3col[,3])
-# write to text table to read in in next step to create the regulon obj
-write.table(x=regulons.validation.3col, file="./GBM_networkB_ARACNe.adj", quote=FALSE,sep='\t',col.names=FALSE,row.names=FALSE)
-# generate regulon obj
-reg.viper.validation <- aracne2regulon("./GBM_networkB_ARACNe.adj", exp.validation, format='3col')
-
-##############################
 # run viper analysis
 ##############################
 # as input expr matrix: use the extracted GX mat for the single cells
 timestamp()
 viper.test <- viper( eset=mat.gx.filt.2, regulon=reg.viper.test, minsize = 3, method='scale', verbose = FALSE, cores=n.cores)
-timestamp()
-viper.validation <- viper( eset=mat.gx.filt.2, regulon=reg.viper.validation, minsize = 3, method='scale', verbose = FALSE, cores=n.cores)
 timestamp()
 # well quick with 32 cores (!)
 
@@ -876,8 +895,6 @@ timestamp()
 keep.mrs.viper <- intersect(keep.mrs, intersect(rownames(viper.test), rownames(viper.validation)))
 viper.test.filt <- viper.test[ match(keep.mrs.viper, rownames(viper.test)), ]
 dim(viper.test.filt)
-viper.validation.filt <- viper.validation[ match(keep.mrs.viper, rownames(viper.validation)), ]
-dim(viper.validation.filt)
 
 ############################################################
 # heatmap of MR activity for both networks
@@ -1139,32 +1156,6 @@ p <- Heatmap( viper.test.filt.state1, use_raster=TRUE,
 			row.anno.viper
 # output as PDF: 
 outputprefix <- paste0( Sys.Date(), "_monocle_analysis_allCells_11_CRC_MR_netA_regulon_activity_heatmap_splitPST_clean_rasterise" )
-# generate outputname
-outputname <- paste( outputprefix, "pdf", sep="." )
-# open plotting device
-pdf(file=outputname, width=16, height=12)
-print(p)
-dev.off()
-
-# netB
-# re-generate row annotations from the MR list:
-# order in same order as vector of CRC MRs to analyse
-row.anno.viper <- rowAnnotation(df=data.frame(subtype=df.mrs$subtype[match(keep.mrs.viper, df.mrs$symbol)]), col=list(subtype=subtype.colours))
-
-# generate heatmap obj
-# colours for diffES heatmap
-cols.es <- colorRamp2( breaks=c(min(viper.validation.filt),0,max(viper.validation.filt)), colors=c("blue", "white", "red") )
-p <- Heatmap( viper.validation.filt, col=cols.es, name="ssGSEA ES", 
-              cluster_columns=TRUE, cluster_rows=TRUE,
-              # define distances for clustering rows/cols
-              clustering_distance_rows="euclidean", clustering_distance_columns="euclidean", 
-              # define clustering methods also
-              clustering_method_rows="average", clustering_method_columns="average",
-              show_row_dend=TRUE, row_names_gp = gpar(fontsize=8),
-              show_row_names=TRUE, column_title_gp = gpar(fontsize = 10),
-              show_column_names=FALSE, top_annotation=ha.anno ) + row.anno.viper
-# output as PDF: 
-outputprefix <- paste0( Sys.Date(), "_monocle_analysis_allCells_11_CRC_MR_netB_regulon_activity_heatmap" )
 # generate outputname
 outputname <- paste( outputprefix, "pdf", sep="." )
 # open plotting device
@@ -1583,13 +1574,6 @@ dev.off()
 # new code 20190704, see ipynb 20190529
 #
 ############################################################
-#####
-# define genes: use *all* the celltype genes from the meta analysis
-#
-# filter for:
-# 1. genes in this sc expr matrix
-# 2. 
-#####
 # read in table:
 list.goi.sigs <- read.csv("./McKenzie_normal_brain_cell_markers_topHumEnrich.csv", stringsAsFactors=F)
 
@@ -1598,8 +1582,8 @@ list.goi.sigs <- list.goi.sigs[ list.goi.sigs$gene %in% rownames(mat.gx.filt.2),
 
 # what's left?
 table(list.goi.sigs$Celltype)
-#ast end mic neu oli
-#858 909 809 859 859
+# ast end mic neu oli
+# 858 909 809 859 859
 #
 # so comparable numbers across cell types; good.
 #

@@ -1,23 +1,76 @@
-#!/bin/R
+#!/bin/R-3.4.3
 
-###### code to produce figures for ATAC/ChIPseq analysis
+########################################
 #
-# code from ipynb 20190507
-
-
-# b06x-cnt2
-# screen name: chip
-
-# request interactive session - 8 cpus!
-# qsub -I -l walltime=24:00:00,mem=64g,nodes=1:ppn=8
-# load R v3.4.3: module load R-bundle/20171215-foss-2017a-R-3.4.3
-# also load kentUtils for bigWigAverageOverBed: module load kentUtils
-
-#############################################
+# sox10_kd_ATAC_ChIPseq_analysis_fig5_sig6a.Rscript
 #
-# setup
+# Mike Fletcher
+# 20201101
 #
-#############################################
+# R version used: 3.4.3
+#
+# (original name: sox10_kd_ATAC_ChIPseq_analysis.Rscript)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# analysis of the SOX10, BRD4 ChIPseq and ATACseq data generated in the SOX10 KD vs NT LN229, ZH487 cell line experiments:
+#
+#	1. first, take the ATAC seq replicates and take the common (i.e. in both) peaks for downstream analysis
+#	2. do peak overlaps amongst the various samples
+#	3. do diffBind analysis of ATACseq, SOX10 KD vs NT, separately for the LN229 and ZH487 samples
+#	4. use bigWigAverageOverBed to get the per-sample signal for the diff-bound peks
+#	5. generate EnrichedHeatmaps of the diff-bound peaks, showing the ATAC/SOX10/BRD4 signal (from 5.) in the KD/NT conditions 
+#	6. annotate the LN229 diff-bound peaks with the LN229 ChromHMM states; produce barplot of TSS/Enh states at those peaks.
+#
+########################################
+# INPUTS
+########################################
+#
+# for each input sample, need the MACS .narrowPeak calls and the SOX10, BRD4 per-sample signal (.bw/bigWig)
+# can be downloaded from GEO: 
+#		https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE121716 - ChIPseq
+#		https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE133040 - ATACseq (note two replicates for each condition!)
+#
+# Gencode (v19) transcriptome reference; as a GRanges object
+#
+########################################
+# OUTPUTS
+########################################
+#
+# many, many, many, many, (...) many plots (.pdf); for overlaps, etc
+# annotated peak tables (.txt) - with genes, etc.
+#
+# FIGURE 5:
+#	- Fig 5E: LN229 ATAC diff-bound peaks; 
+#		heatmap of Control SOX10, Control ATAC, SOX10 KD ATAC, Control BRD4, SOX10 KD BRD4
+#	- Fig 5G: LN229 ATAC diff-bound peaks, annotated by LN229 ChromHMM states (TSS/Enh)
+#	- Fig 5I: LN229 SO10 peaks, showing SOX10, BRD4, H3K27ac, H3K4me1, H3K4me3 signal
+#
+# SUPPLEMENTARY FIGURE 6:
+#	- Fig 6A: ZH487 ATAC diff-bound peaks,
+#		heatmap of Control SOX10, Control ATAC, SOX10 KD ATAC, Control BRD4, SOX10 KD BRD4
+#	- Fig 6C: ZH487 SOX10 peaks, showing SOX10 and BRD4 signal
+# 
+# R environment (.Rdata) and session information (.txt)
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# this has some chunky data - parallelisation is required!
+# I used 8 cores, 8g mem per CPU.
+#
+########################################
+
+########################################
+#
+# START CODE
+#
+########################################
 # define #cores to parallelise over; set based on #cores requested for job
 n.cores <- 8
 
@@ -374,112 +427,246 @@ for( name in names(peaks.zh.anno) )
   write.csv(file=outputname, x=peaks.zh.anno[[name]])  
 }
 
-##############################
-# do GO testing for selected peaksets:
+############################################################
 #
-# (a) shared SOX10 peaks in LN229+ZH487, NT
-# (b) shared BRD4 peaks in LN229+ZH487, NT
-# (c) 4-way overlap of LN229+ZH487 SOX10+BRD4, NT
-# (d) LN229 ATAC: NT only, shSOX10 only, shared peaks
-# (e) SOX10, BRD4 peaks in the NT and shSOX10 conditions in LN229+ZH487 also.
-# (f) ZH487 ATAC: NT only, shSOX10 only, shared peaks
+# look up signal for genomic loci plots showing factor signal in peaksets:
+# (code from ipynb 20190318)
+# 
+# for LN229 and ZH487, separately; in NT:
 #
-##############################
-# also output these peaksets as bed for HOMER motif finding
-##############################
-# set up a GRList of these peaksets, with meaningful names!
+# in SOX10 peaks: look up SOX10, BRD4, H3K27ac/K4me1/K4me3 (LN229 only)
+# in BRD4 peaks: same.
 #
-# first need to generate the overlaps:
-# calculate for the ATAC once as will extract 3 times
-atac.ln.olaps <- findOverlapsOfPeaks( peaks.ln[["NT_ATAC"]], peaks.ln[["shSOX10_ATAC"]] )
-atac.zh.olaps <- findOverlapsOfPeaks( peaks.zh[["NT_ATAC"]], peaks.zh[["shSOX10_ATAC"]] )
-# now make a list 
-peaks.testing <- GRangesList(
-  LN229_ZH487_NT_shared_SOX10=findOverlapsOfPeaks( peaks.ln[["NT_SOX10"]], peaks.zh[["NT_SOX10"]] )$mergedPeaks,
-  LN229_ZH487_NT_shared_BRD4=findOverlapsOfPeaks( peaks.ln[["NT_BRD4"]], peaks.zh[["NT_BRD4"]] )$mergedPeaks,
-  NT_4way_overlap=findOverlapsOfPeaks( peaks.ln[["NT_BRD4"]], peaks.ln[["NT_SOX10"]], peaks.zh[["NT_BRD4"]], peaks.zh[["NT_SOX10"]] )$mergedPeaks, 
-  LN229_ATAC_unique_NT=atac.ln.olaps$peaklist$`peaks.ln...NT_ATAC...`,
-  LN229_ATAC_unique_shSOX10=atac.ln.olaps$peaklist$`peaks.ln...shSOX10_ATAC...`,
-  LN229_ATAC_shared=atac.ln.olaps$mergedPeaks,
-  ZH487_ATAC_unique_NT=atac.zh.olaps$peaklist$`peaks.zh...NT_ATAC...`,
-  ZH487_ATAC_unique_shSOX10=atac.zh.olaps$peaklist$`peaks.zh...shSOX10_ATAC...`,
-  ZH487_ATAC_shared=atac.zh.olaps$mergedPeaks     
+############################################################
+# now: need to get the normalize matrix signal for all samples, at the appropriate regions of interest...
+##############################
+##############
+# need to export the regions of interest:
+#
+# LN229, NT SOX10 peaks
+# ZH487, NT SOX10 peaks
+# LN229, NT BRD4 peaks
+# ZH487, NT BRD4 peaks
+#
+##############
+# export as BED with rtracklayer
+#
+# LN229, NT SOX10 peaks
+outputname <- "./tables/LN229_NT_SOX10_peaks.bed"
+output.bed(gr=peaks.ln[["NT_SOX10"]], outputname=outputname )
+# ZH487, NT SOX10 peaks
+outputname <- "./tables/ZH487_NT_SOX10_peaks.bed"
+output.bed(gr=peaks.zh[["NT_SOX10"]], outputname=outputname )
+# LN229, NT BRD4 peaks
+outputname <- "./tables/LN229_NT_BRD4_peaks.bed"
+output.bed(gr=peaks.ln[["NT_BRD4"]], outputname=outputname )
+# ZH487, NT BRD4 peaks
+outputname <- "./tables/ZH487_NT_BRD4_peaks.bed"
+output.bed(gr=peaks.zh[["NT_BRD4"]], outputname=outputname )
+
+##############
+# now: need to run bigWigAverageOverBed
+##############
+# usage: bigWigAverageOverBed in.bw in.bed out.tab
+#
+# so, first: define args as df
+#
+# example input bw path - SES-normalised intensities:
+#      /icgc/dkfzlsdf/analysis/hipo/hipo_016/user_folder/herrmanc/data/2019-02-21_chipseq_14234/ZH487/NT/SOX10/bw/ZH487_NT_SOX10_SES_subtract.bw
+# for in.bed: use the peakset bedfiles exported above
+# out.tab: define per factor/peakset
+#
+# first get a list of the input bw for the ChIP samples:
+path.bigwig <- system2("find", args=paste0( dir.data, " -name *_SES_subtract.bw"), stdout=TRUE )
+# need to add in the ATAC intensities also:
+path.atac.bw <- system2("find", args=paste0( dir.atac, " -name LN229_????.bw"), stdout=TRUE )
+# again, remove the ones in subdir /sox10/ (sigh)
+path.atac.bw <- path.atac.bw[!grepl(pattern="/sox10/", x=path.atac.bw)]
+# get paths to the LN229 histone bw files - in Qi's analysis dir; use the SES-normalised bigwigs
+dir.data.histones <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/yonghe/new/"
+path.bigwig.histones <- system2("find", args=paste0( dir.data.cells, " -name LN229_???_H3*_SES_subtract.bw"), stdout=TRUE )
+#
+# combine into one vector and order alphabetically, so can use in df building next:
+# order as follows:
+# [1] LN229, NT, SOX10
+# [2] LN229, NT, BRD4
+# [3] ZH487, NT, SOX10
+# [4] ZH487, NT, BRD4
+#             
+# [5] LN229, NT, H3K27ac
+# [6] LN229, NT, H3K4me1
+# [7] LN229, NT, H3K4me3
+#
+# hardcode this due to non-standardised filenames/paths...
+path.signal <- c( path.bigwig[c(4,8,1,5)], path.bigwig.histones[c(5,13,3)] )                    
+#
+# load these signal bigwigs, as GRs
+gr.signal.nt <- mclapply(X=path.signal, FUN=rtracklayer::import, format="BigWig", mc.cores=n.cores)
+# add names
+names(gr.signal.nt) <- c("LN229_NT_SOX10", "LN229_NT_BRD4", "ZH487_NT_SOX10", "ZH487_NT_BRD4", 
+                         "LN229_NT_H3K27ac", "LN229_NT_H3K4me1", "LN229_NT_H3K4me3")
+
+# generate mats for EnrichedHeatmap, to plot:
+# args: target=defined target peaksets - SOX10 or BRD4 NT peaks, per cell line; 
+#       value_column=name of mcol with signal,
+#       extend by 1kbp (each side) around the peak, defined mean mode, w=50 windows in these regions
+#       smooth the signal, and remove extreme values above the 99th percentile
+# parallelise with mclapply
+# do the two cell lines separately, and for each peakset separately
+#
+################ will take some time!
+#
+# LN229
+# SOX10 peaks
+list.mat.signal.nt.ln.sox <- mclapply(X=gr.signal.nt[grepl(pattern="LN229_", x=names(gr.signal.nt))], 
+                          FUN=normalizeToMatrix, 
+                          target=peaks.ln$NT_SOX10, 
+                          value_column = "score", extend = 1000, mean_mode = "w0", w = 50,
+                          smooth=TRUE, keep = c(0, 0.99), mc.cores=n.cores )
+# BRD4 peaks
+list.mat.signal.nt.ln.brd <- mclapply(X=gr.signal.nt[grepl(pattern="LN229_", x=names(gr.signal.nt))], 
+                          FUN=normalizeToMatrix, 
+                          target=peaks.ln$NT_BRD4, 
+                          value_column = "score", extend = 1000, mean_mode = "w0", w = 50,
+                          smooth=TRUE, keep = c(0, 0.99), mc.cores=n.cores )
+# ZH487
+# SOX10 peaks
+list.mat.signal.nt.zh.sox <- mclapply(X=gr.signal.nt[grepl(pattern="ZH487_", x=names(gr.signal.nt))], 
+                          FUN=normalizeToMatrix, 
+                          target=peaks.zh$NT_SOX10, 
+                          value_column = "score", extend = 1000, mean_mode = "w0", w = 50,
+                          smooth=TRUE, keep = c(0, 0.99), mc.cores=n.cores )
+# BRD4 peaks
+list.mat.signal.nt.zh.brd <- mclapply(X=gr.signal.nt[grepl(pattern="ZH487_", x=names(gr.signal.nt))], 
+                          FUN=normalizeToMatrix, 
+                          target=peaks.zh$NT_BRD4,
+                          value_column = "score", extend = 1000, mean_mode = "w0", w = 50,
+                          smooth=TRUE, keep = c(0, 0.99), mc.cores=n.cores )
+
+# next: as per Zuguang's suggestion, follow
+# https://github.com/jokergoo/EnrichedHeatmap/issues/36
+#
+# plot colMeans of the matrices directly: do for each set of normalizedMatrices above.
+#
+# note that we have VERY different signal intensities; so scale each factor's signal 
+#
+# common plot stuff:
+# colour scale for lineplots
+cols.signal <- c(SOX10="darkgreen",BRD4="darkblue",H3K27ac="purple",H3K4me1="limegreen",H3K4me3="red")
+
+##########
+# LN229, SOX10 peaks
+##########
+# find #cols (depends on the #windows used in normalizeToMatrix)
+n.cols <- ncol(list.mat.signal.nt.ln.sox[[1]]) 
+# x-axis positions = genomic windows of 1000bp up/downstream of target
+# have 60 columns in these matrices; but not all need names, name the important ones:
+x.ticks <- c("-1000bp", rep("",9), "-500bp", rep("",9), "peak start", rep("",18), "peak end", rep("",9), "+500bp",
+             rep("",9), "+1000bp") 
+
+# generate plotting df for ggplot2
+plot.df <- data.frame(
+  signal=c( scale(colMeans(list.mat.signal.nt.ln.sox$LN229_NT_SOX10)), scale(colMeans(list.mat.signal.nt.ln.sox$LN229_NT_BRD4)),
+           scale(colMeans(list.mat.signal.nt.ln.sox$LN229_NT_H3K27ac)), scale(colMeans(list.mat.signal.nt.ln.sox$LN229_NT_H3K4me1)),
+           scale(colMeans(list.mat.signal.nt.ln.sox$LN229_NT_H3K4me3)) ),
+  factor=c( rep("SOX10",n.cols), rep("BRD4",n.cols), rep("H3K27ac",n.cols), rep("H3K4me1",n.cols), 
+           rep("H3K4me3",n.cols) ),
+  window=rep(1:n.cols, times=length(list.mat.signal.nt.ln.sox))  
 )
+# plot
+outputname <- paste0( Sys.Date(), "_03_LN229_NT_SOX10_peaks_factor_signal_scaled.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot(data=plot.df, aes(x=window,y=signal, colour=factor)) + 
+geom_line() + scale_colour_manual(values=cols.signal) + # add line geom; set colour scale manually as defined above
+scale_x_continuous(breaks=1:n.cols, labels=x.ticks) + # define x-axis tick mark labels manually
+theme_bw() + xlab(NULL) + ylab("scaled SES-normalised signal") + ggtitle("LN229 NT - SOX10 peaks") + # b/w theme, fix axis labels
+theme(axis.text.x=element_text(angle=90, hjust=1, vjust=.5)) + # rotate x-axis tick labels by 90degrees, adjust justification
+geom_vline(xintercept=21, linetype="dashed") + geom_vline(xintercept=40, linetype="dashed") # add vertical lines @ target region boundaries
+dev.off()
 
-# output each of these peaksets as a bedfile, for HOMER motif finding:
-for( name in names(peaks.testing) )
-{
-    outputname <- paste0( Sys.Date(), "_", name, "_peaks_forHOMER.bed" )
-    output.bed(gr=peaks.testing[[name]], peaksetName=name, outputname=outputname)
-}    
-#
-#
-# next: annotate peaks with genes:
-peaks.testing.anno <- mclapply(X=peaks.testing, FUN=annotatePeakInBatch,
-         # options for annotatePeakInBatch
-         AnnotationData=annoData, # use Ensembl v79
-         output="nearestLocation",
-         bindingRegion=c(-2000, 2000), # promoter region definition
-         mc.cores=n.cores)
-# write to text
-for( name in names(peaks.testing.anno) )
-{
-    outputname <- paste0( Sys.Date(), "_", name, "_peaks_annotated_by_gene.csv" )
-    write.csv(x=as.data.frame(peaks.testing.anno[[name]]), file=outputname)
-}   
+##########
+# LN229, BRD4 peaks
+##########
+# find #cols (depends on the #windows used in normalizeToMatrix)
+n.cols <- ncol(list.mat.signal.nt.ln.brd[[1]]) 
+# x-axis positions = genomic windows of 1000bp up/downstream of target
+# have 54 (!?) columns in these matrices; but not all need names, name the important ones:
+x.ticks <- c("-1000bp", rep("",9), "-500bp", rep("",9), "peak start", rep("",12), "peak end", rep("",9), "+500bp",
+             rep("",9), "+1000bp") 
 
-###############
-# add in the single-factor samples also, before doing testing:
-###############
-peaks.testing.anno <- c(peaks.testing.anno, peaks.ln.anno, peaks.zh.anno)
+# generate plotting df for ggplot2
+plot.df <- data.frame(
+  signal=c( scale(colMeans(list.mat.signal.nt.ln.brd$LN229_NT_SOX10)), scale(colMeans(list.mat.signal.nt.ln.brd$LN229_NT_BRD4)),
+           scale(colMeans(list.mat.signal.nt.ln.brd$LN229_NT_H3K27ac)), scale(colMeans(list.mat.signal.nt.ln.brd$LN229_NT_H3K4me1)),
+           scale(colMeans(list.mat.signal.nt.ln.brd$LN229_NT_H3K4me3)) ),
+  factor=c( rep("SOX10",n.cols), rep("BRD4",n.cols), rep("H3K27ac",n.cols), rep("H3K4me1",n.cols), 
+           rep("H3K4me3",n.cols) ),
+  window=rep(1:n.cols, times=length(list.mat.signal.nt.ln.brd))  
+)
+# plot
+outputname <- paste0( Sys.Date(), "_03_LN229_NT_BRD4_peaks_factor_signal_scaled.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot(data=plot.df, aes(x=window,y=signal, colour=factor)) + 
+geom_line() + scale_colour_manual(values=cols.signal) + # add line geom; set colour scale manually as defined above
+scale_x_continuous(breaks=1:n.cols, labels=x.ticks) + # define x-axis tick mark labels manually
+theme_bw() + xlab(NULL) + ylab("scaled SES-normalised signal") + ggtitle("LN229 NT - BRD4 peaks") + # b/w theme, fix axis labels
+theme(axis.text.x=element_text(angle=90, hjust=1, vjust=.5)) + # rotate x-axis tick labels by 90degrees, adjust justification
+geom_vline(xintercept=21, linetype="dashed") + geom_vline(xintercept=34, linetype="dashed") # add vertical lines @ target region boundaries
+dev.off()
 
-# fix the names here: need to add the cell line to the 10-15th (LN229) and 16th-21st (ZH487) names
-names(peaks.testing.anno)[10:15] <- paste0("LN229_", names(peaks.testing.anno)[10:15]) 
-names(peaks.testing.anno)[16:19] <- paste0("ZH487_", names(peaks.testing.anno)[16:21]) 
+##########
+# ZH487, SOX10 peaks
+##########
+# find #cols (depends on the #windows used in normalizeToMatrix)
+n.cols <- ncol(list.mat.signal.nt.zh.sox[[1]]) 
+# x-axis positions = genomic windows of 1000bp up/downstream of target
+# have 66 columns in these matrices; but not all need names, name the important ones:
+x.ticks <- c("-1000bp", rep("",9), "-500bp", rep("",9), "peak start", rep("",24), "peak end", rep("",9), "+500bp",
+             rep("",9), "+1000bp") 
 
-###############
-# now do GO testing:
-###############
-# can't parallelise here
-peaks.testing.anno.go <- lapply(X=peaks.testing.anno, FUN=getEnrichedGO,
-                     orgAnn="org.Hs.eg.db", maxP=0.05, minGOterm=10, 
-                     multiAdjMethod="BH", condense=TRUE)
-# write BP, CC results to tables
-for( name in names(peaks.testing.anno.go) )
-{
-  outputname <- paste0( Sys.Date(), "_", name, "_peaks_GO_testing_BP.csv")
-  write.csv(file=outputname, x=peaks.testing.anno.go[[name]]$bp)  
-  outputname <- paste0( Sys.Date(), "_", name, "_peaks_GO_testing_CC.csv")
-  write.csv(file=outputname, x=peaks.testing.anno.go[[name]]$cc)  
-}
-#
-###############
-# do pathway (reactome DB) testing
-###############
-# can't parallelise here
-# relax pval threshold to 0.1
-peaks.testing.anno.pw <- lapply(X=peaks.testing.anno, FUN=getEnrichedPATH,
-                     orgAnn="org.Hs.eg.db", pathAnn="reactome.db", maxP=0.1, multiAdjMethod="BH"  )
-# now simplify results: have a row per gene hitting a pathway (!!); 
-# so take only the unique rows (without this gene ID, in the EntrezID column)
-peaks.testing.anno.pw <- lapply(X=peaks.testing.anno.pw, FUN=function(df)
-                          unique( subset(x=df, select= -EntrezID) ) )
-# flatten list of enriched pathways to a df
-peaks.testing.anno.pw <- do.call(rbind, peaks.testing.anno.pw)
-# get sample name from rownames
-peaks.testing.anno.pw$sample <- sapply(X=strsplit(rownames(peaks.testing.anno.pw), "[.]"), FUN="[", 1)
+# generate plotting df for ggplot2
+plot.df <- data.frame(
+  signal=c( scale(colMeans(list.mat.signal.nt.zh.sox$ZH487_NT_SOX10)), scale(colMeans(list.mat.signal.nt.zh.sox$ZH487_NT_BRD4)) ),
+  factor=c( rep("SOX10",n.cols), rep("BRD4",n.cols) ),
+  window=rep(1:n.cols, times=length(list.mat.signal.nt.zh.sox))  
+)
+# plot
+outputname <- paste0( Sys.Date(), "_03_ZH487_NT_SOX10_peaks_factor_signal_scaled.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot(data=plot.df, aes(x=window,y=signal, colour=factor)) + 
+geom_line() + scale_colour_manual(values=cols.signal) + # add line geom; set colour scale manually as defined above
+scale_x_continuous(breaks=1:n.cols, labels=x.ticks) + # define x-axis tick mark labels manually
+theme_bw() + xlab(NULL) + ylab("scaled SES-normalised signal") + ggtitle("ZH487 NT - SOX10 peaks") + # b/w theme, fix axis labels
+theme(axis.text.x=element_text(angle=90, hjust=1, vjust=.5)) + # rotate x-axis tick labels by 90degrees, adjust justification
+geom_vline(xintercept=21, linetype="dashed") + geom_vline(xintercept=46, linetype="dashed") # add vertical lines @ target region boundaries
+dev.off()
 
-# need to add pathway names by matching pathway IDs, to that column of the results df
-# get ID to name map as list
-path.map <- as.list(reactomePATHID2NAME)
-# for some reason there are fucking pathways NOT in this mapping list, but ARE in the db tested? sigh. so filter:
-peaks.testing.anno.pw <- peaks.testing.anno.pw[peaks.testing.anno.pw$path.id %in% names(path.map),]
-# now map:
-peaks.testing.anno.pw$PATH <- unlist(path.map[as.character(peaks.testing.anno.pw$path.id)])
+##########
+# ZH487, BRD4 peaks
+##########
+# find #cols (depends on the #windows used in normalizeToMatrix)
+n.cols <- ncol(list.mat.signal.nt.zh.brd[[1]]) 
+# x-axis positions = genomic windows of 1000bp up/downstream of target
+# have 54 (!?) columns in these matrices; but not all need names, name the important ones:
+x.ticks <- c("-1000bp", rep("",9), "-500bp", rep("",9), "peak start", rep("",25), "peak end", rep("",9), "+500bp",
+             rep("",9), "+1000bp") 
 
-# write results to tables
-outputname <- paste0( Sys.Date(), "_all_peaksets_Reactome_testing.csv")
-write.csv(file=outputname, x=peaks.testing.anno.pw)
+# generate plotting df for ggplot2
+plot.df <- data.frame(
+  signal=c( scale(colMeans(list.mat.signal.nt.zh.brd$ZH487_NT_SOX10)), scale(colMeans(list.mat.signal.nt.zh.brd$ZH487_NT_BRD4)) ),
+  factor=c( rep("SOX10",n.cols), rep("BRD4",n.cols) ),
+  window=rep(1:n.cols, times=length(list.mat.signal.nt.zh.brd))  
+)
+# plot
+outputname <- paste0( Sys.Date(), "_03_ZH487_NT_BRD4_peaks_factor_signal_scaled.pdf" )
+pdf(outputname, height=6, width=6)
+ggplot(data=plot.df, aes(x=window,y=signal, colour=factor)) + 
+geom_line() + scale_colour_manual(values=cols.signal) + # add line geom; set colour scale manually as defined above
+scale_x_continuous(breaks=1:n.cols, labels=x.ticks) + # define x-axis tick mark labels manually
+theme_bw() + xlab(NULL) + ylab("scaled SES-normalised signal") + ggtitle("ZH487 NT - BRD4 peaks") + # b/w theme, fix axis labels
+theme(axis.text.x=element_text(angle=90, hjust=1, vjust=.5)) + # rotate x-axis tick labels by 90degrees, adjust justification
+geom_vline(xintercept=21, linetype="dashed") + geom_vline(xintercept=47, linetype="dashed") # add vertical lines @ target region boundaries
+dev.off()
 
 #############################################
 # 

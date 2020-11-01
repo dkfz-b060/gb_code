@@ -1,16 +1,57 @@
 #!/bin/bash
 
-##### code to do HOMER motif finding on ATAC diff bound peaks
+########################################
 #
-# code from ipynb 20191108
-
-# b06x-cnt2
-# screen name: chip
+# sox10_kd_ATAC_HOMER_motif_finding_fig4f_sfig6b.sh
 #
-# request interactive job with plenty of res to parallelise homer motif finding:
-#    qsub -I -l walltime=12:00:00,mem=16g,nodes=1:ppn=16
-# 
+# Mike Fletcher
+# 20201101
+#
+# (original name: sox10_kd_ATAC_HOMER_motif_finding.sh; code adapted from ipynb 20191108)
+#
+########################################
+#
+# WHAT THIS DOES
+#
+########################################
+#
+# takes the differential ATAC peaks for the two cell lines (LN229, ZH487)
+# between the two conditions (shSOX10, NT/control)
+#
+# does motif finding (HOMER) on each peakset, using the other condition as background
+#
+########################################
+# INPUTS
+########################################
+#
+# need, for both the LN229 and ZH487 cell lines:
+#	
+# - the diffBind up/down shSOX10/NT peaks, output by sox10_kd_ATAC_ChIPseq_analysis_fig4.Rscript
+#	example filenames (note datestamped!):
+#		2019-05-07_LN229_ATAC_diff_bound_peaks_NT_up_forHOMER.bed
+#		2019-05-07_LN229_ATAC_diff_bound_peaks_shSOX10_up_forHOMER.bed
+#		
+#
+########################################
+# OUTPUTS
+########################################
+#
+# HOMER motif finding (matching against known motifs - no de novo!) results for the up/down peaks used as input
+#
+########################################
+# RESOURCE USAGE
+########################################
+#
+# this does a lot of motif finding using HOMER; so to speed it up parallelise over CPUs
+#		(it's quite lightweight mem-wise so I use 1g per core)
+#
+########################################
 
+########################################
+#
+# START CODE
+#
+########################################
 # define HOMER dir: use Chris'
 HOMER_DIR="/icgc/dkfzlsdf/analysis/B060/aichmueller_pan_cancer/software/HOMER/bin/"
 # add to PATH
