@@ -1,5 +1,6 @@
 # Glioblastoma epigenome profiling identifies SOX10 as a master regulator of molecular tumour subtype
 
+
 Yonghe Wu\*, Michael Fletcher\*, Zuguang Gu\*, Qi Wang, Barbara Costa, Anna Bertoni, Ka-Hou Man, Magdalena Schlotter, Jörg Felsberg, Jasmin Mangei, Martje Barbus, Ann-Christin Gaupel, Wei Wang, Tobias Weiss, Roland Eils, Michael Weller, Haikun Liu, Guido Reifenberger, Andrey Korshunov, Peter Angel, Peter Lichter, Carl Herrmann$, Bernhard Radlwimmer$
 
 *\* co-first authors*
