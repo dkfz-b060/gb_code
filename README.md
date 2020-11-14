@@ -12,7 +12,7 @@ Yonghe Wu\*, Michael Fletcher\*, Zuguang Gu\*, Qi Wang, Barbara Costa, Anna Bert
 
 Hello! Welcome to the code repository for our paper.
 
-If you've seen the paper, or looked at our GEO accession, you'll realise there's a *lot* of data/analysis - please ask us if you have any issues with, want to discuss, or need help troubleshooting the code.
+If you've seen the paper, or looked at our GEO/EGA accessions, you'll realise there's a *lot* of data/analysis - please ask us if you have any issues with, want to discuss, or need help troubleshooting the code.
 
 * WGBS, RNAseq data processing; methylation analysis (PMD/LMR/DMV feature calling, basic statistics, etc. as in Figs 1-2) was handled by Zuguang Gu [email: z.gu [AT] dkfz-heidelberg.de]
 * ChIPseq data processing; tumour/cell line ChromHMM, tumour CRC analysis (as in Fig 3) was done by Carl Hermann [email: carl.herrmann [AT] bioquant.uni-heidelberg.de ] and Qi Wang
@@ -28,9 +28,9 @@ https://dkfz-b060.github.io/gb_browse/
 
 ## Data deposition
 
-Raw, protected (patient sample) data has been deposited at the EGA, but has not yet been made open (again, will be updated!).
+**Raw, protected (patient sample)** data has been deposited at the **EGA** at https://www.ebi.ac.uk/ega/studies/EGAS00001003953
 
-Processed data is **available at the GEO**: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE121723 (SuperSeries)
+**Processed** data is **available at the GEO**: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE121723 (SuperSeries)
 
 The subseries consist of:
 
