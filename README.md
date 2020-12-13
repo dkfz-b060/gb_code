@@ -21,11 +21,15 @@ If you've seen the paper, or looked at our GEO/EGA accessions, you'll realise th
 
 For general enquiries, please contact the corresponding authors: Carl (email above) or Bernhard Radlwimmer [email: b.radlwimmer [AT] dkfz-heidelberg.de]
 
-## Genome browser
+## WashU Epigenome Browser Datahub
 
-You might also be interested in checking out our genome browser - it uses GEO's hosted files and the WashU browser to display our data.
+We've created a .json Datahub file for the WashU Epigenome browser: http://epigenomegateway.wustl.edu/browser/
 
-https://dkfz-b060.github.io/gb_browse/
+Instructions on how to load the Datahub are available at https://epigenomegateway.readthedocs.io/en/latest/usage.html#adding-a-custom-track-or-data-hub
+
+Information on the format of the Datahub .json (if you'd like to edit it yourself, say) can be found at https://epigenomegateway.readthedocs.io/en/latest/datahub.html
+
+**Get the Datahub**: https://github.com/dkfz-b060/gb_code/blob/master/WashU_Browser_Datahub_all_tracks.json
 
 ## Data deposition
 
