@@ -7,7 +7,7 @@ Yonghe Wu\*, Michael Fletcher\*, Zuguang Gu\*, Qi Wang, Barbara Costa, Anna Bert
 
 *$ co-corresponding authors*
 
-#### accepted at Nature Communications (will be updated when we have those details!)
+#### Published online (2020-12-18) at Nature Communications: https://doi.org/10.1038/s41467-020-20225-w
 
 ## Introduction
 
