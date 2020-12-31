@@ -24,6 +24,7 @@ For general enquiries, please contact the corresponding authors: Carl (email abo
 ## WashU Epigenome Browser Datahub
 
 ![WashU Epigenome Browser view of RTK_I tracks at the RTK_I MR MYT1](https://github.com/dkfz-b060/gb_code/blob/master/WashU_MYT1_RTK_I.jpg)
+
 *The complete set of tracks for the RTK_I subtype at the MYT1 gene (as seen in Figure 1); from top to bottom: H3K27ac ChIPseq; subtype superenhancers; H3K4me3, H3K4me1, H3K36me3, H3K27me3, H3K9me3 ChIPseq; RNAseq; methylation (WGBS); MACS2 narrow peak calls for histone mark ChIPseq; subtype methylation features (PMDs, DMVs, LMRs); MACS2 broad peak calls for the histone mark ChIPseq; ChromHMM*
 
 We've created a .json Datahub file for the WashU Epigenome browser: http://epigenomegateway.wustl.edu/browser/
